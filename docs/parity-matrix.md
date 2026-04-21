@@ -57,11 +57,20 @@ This matrix is the cutover-oriented view of what is already implemented in `PROB
   - webhook audit inspection
   - webhook audit stats
 
+Local verification already completed for this group:
+
+- contract compare on tested read endpoints
+- safe playlist write compare between legacy and worker
+- username update write/read verification
+- payment confirm empty-body validation parity
+- billing issue-key empty-body validation parity
+
 ## Implemented, but needs deeper parity checks
 
 - Payments
   - replay-safe webhook operations
   - failed billing inspection UX/admin workflows
+  - live Toss-backed staging write verification
 - Billing scheduler
   - Worker cron/manual execution exists
   - production retry/backoff and notification parity still needs staging verification
@@ -74,6 +83,9 @@ This matrix is the cutover-oriented view of what is already implemented in `PROB
 - Provider portability
   - mysql/postgres/d1 runtime exists
   - only mysql should currently be considered the default parity path
+- Billing/create and pause/resume
+  - route parity exists
+  - live staging write verification still required
 
 ## Not yet parity-complete
 

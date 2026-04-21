@@ -10,6 +10,7 @@ import {
 } from "../lib/db";
 import { hydrateAssets } from "../lib/assets";
 import { success } from "../lib/response";
+import { MembershipTier } from "../lib/membership";
 import {
   optionalSessionFromRequest,
   requireSessionFromRequest,
@@ -37,6 +38,7 @@ interface PlaylistMetadataRow extends RowDataPacket {
 
 interface MusicIdRow extends RowDataPacket {
   music_id: string;
+  custom_title?: string | null;
 }
 
 interface PermissionRow extends RowDataPacket {
@@ -53,6 +55,7 @@ interface PlaylistCreateBody {
   title?: string;
   description?: string;
   is_public?: boolean;
+  is_default?: boolean;
   metadata?: Record<string, string>;
 }
 
@@ -66,6 +69,8 @@ interface PlaylistUpdateBody {
   description?: string;
   is_public?: boolean;
   is_hide?: boolean;
+  is_default?: boolean;
+  user_id?: string;
   metadata?: Record<string, string>;
 }
 
@@ -156,15 +161,13 @@ async function getPlaylistsByQuery(
     is_default: Boolean(row.is_default),
     is_public: Boolean(row.is_public),
     music_count: row.music_count,
-    thumbnail: metadataMap[row.id]?.thumbnail || null,
-    cover_image_url: metadataMap[row.id]?.cover_image_url || null,
     metadata: metadataMap[row.id] || {},
   }));
 }
 
 async function getPublicPlaylists(connection: DbConnection, page: number, limit: number) {
   const offset = (page - 1) * limit;
-  return getPlaylistsByQuery(
+  const items = await getPlaylistsByQuery(
     connection,
     `SELECT p.*, COUNT(pm.music_id) AS music_count
      FROM playlist p
@@ -175,6 +178,12 @@ async function getPublicPlaylists(connection: DbConnection, page: number, limit:
      LIMIT ? OFFSET ?`,
     [limit, offset],
   );
+  return {
+    items,
+    total_count: items.length,
+    page,
+    limit,
+  };
 }
 
 async function getOwnedPlaylists(connection: DbConnection, userId: string) {
@@ -306,6 +315,7 @@ async function getPlaylistById(
   playlistId: string,
   session: AuthSession | null,
   requiredPermission: "read" | "write" | "admin" = "read",
+  deniedMessage?: string,
 ) {
   const permission = await hasPlaylistPermission(
     connection,
@@ -319,10 +329,26 @@ async function getPlaylistById(
   }
 
   if (!permission.allowed) {
-    throw new HTTPException(403, { message: "Playlist access denied" });
+    const defaultDeniedMessage =
+      requiredPermission === "read"
+        ? "플레이리스트를 조회할 권한이 없습니다."
+        : requiredPermission === "write"
+          ? "플레이리스트를 수정할 권한이 없습니다."
+          : "플레이리스트를 관리할 권한이 없습니다.";
+    throw new HTTPException(400, {
+      message: deniedMessage || defaultDeniedMessage,
+    });
   }
 
   const metadataMap = await getMetadataForPlaylists(connection, [playlistId]);
+  const musicRows = await queryRows<MusicIdRow>(
+    connection,
+    `SELECT music_id
+     FROM playlist_music
+     WHERE playlist_id = ?
+     ORDER BY sort_order ASC, added_at ASC`,
+    [playlistId],
+  );
   return {
     id: permission.playlist.id,
     user_id: permission.playlist.user_id,
@@ -333,11 +359,19 @@ async function getPlaylistById(
     is_hide: Boolean(permission.playlist.is_hide),
     is_default: Boolean(permission.playlist.is_default),
     is_public: Boolean(permission.playlist.is_public),
-    music_count: permission.playlist.music_count,
-    thumbnail: metadataMap[playlistId]?.thumbnail || null,
-    cover_image_url: metadataMap[playlistId]?.cover_image_url || null,
+    musics: musicRows.map((row) => row.music_id),
     metadata: metadataMap[playlistId] || {},
   };
+}
+
+function toLegacyKeywordArray(keywords: Record<string, string[]>) {
+  const result: Array<{ type: string; content: string }> = [];
+  for (const [type, values] of Object.entries(keywords)) {
+    for (const value of values) {
+      result.push({ type, content: value });
+    }
+  }
+  return result;
 }
 
 async function getPlaylistMusics(
@@ -352,10 +386,16 @@ async function getPlaylistMusics(
     return null;
   }
 
+  const countRows = await queryRows<{ count: number } & RowDataPacket>(
+    connection,
+    "SELECT COUNT(*) AS count FROM playlist_music WHERE playlist_id = ?",
+    [playlistId],
+  );
+  const totalCount = countRows[0]?.count || 0;
   const offset = (page - 1) * limit;
   const rows = await queryRows<MusicIdRow>(
     connection,
-    `SELECT music_id
+    `SELECT music_id, custom_title
      FROM playlist_music
      WHERE playlist_id = ?
      ORDER BY sort_order ASC, added_at ASC
@@ -365,7 +405,20 @@ async function getPlaylistMusics(
 
   const ids = rows.map((row) => row.music_id);
   const items = await hydrateAssets(connection, ids);
-  return { playlist, items };
+  const customTitleMap = new Map(rows.map((row) => [row.music_id, row.custom_title ?? null]));
+  return {
+    items: items.map((item) => ({
+      id: item.id,
+      metadata: item.metadata,
+      keywords: toLegacyKeywordArray(item.keywords),
+      files: item.files,
+      custom_title: customTitleMap.get(item.id) ?? null,
+    })),
+    count: items.length,
+    total_count: totalCount,
+    current_page: page,
+    total_pages: totalCount === 0 ? 0 : Math.ceil(totalCount / limit),
+  };
 }
 
 async function setPlaylistMetadata(
@@ -396,6 +449,37 @@ async function setPlaylistMetadata(
       );
     }
   }
+}
+
+async function getPlaylistMetadata(connection: DbConnection, playlistId: string) {
+  const metadataMap = await getMetadataForPlaylists(connection, [playlistId]);
+  return metadataMap[playlistId] || {};
+}
+
+async function deletePlaylistMetadata(
+  connection: DbConnection,
+  playlistId: string,
+  key: string,
+) {
+  const existing = await queryRows<RowDataPacket & { id: string }>(
+    connection,
+    `SELECT id
+     FROM playlist_metadata
+     WHERE playlist_id = ? AND meta_key = ?
+     LIMIT 1`,
+    [playlistId, key],
+  );
+  if (!existing[0]) {
+    return false;
+  }
+
+  await queryRows(
+    connection,
+    "DELETE FROM playlist_metadata WHERE id = ?",
+    [existing[0].id],
+  );
+  await touchPlaylist(connection, playlistId);
+  return true;
 }
 
 async function touchPlaylist(connection: DbConnection, playlistId: string) {
@@ -501,11 +585,20 @@ async function revokePlaylistPermission(
   playlistId: string,
   targetUserId: string,
 ) {
+  const existing = await queryRows<RowDataPacket & { count: number }>(
+    connection,
+    "SELECT COUNT(*) AS count FROM playlist_permissions WHERE playlist_id = ? AND user_id = ?",
+    [playlistId, targetUserId],
+  );
+  if ((existing[0]?.count || 0) === 0) {
+    return false;
+  }
   await queryRows(
     connection,
     "DELETE FROM playlist_permissions WHERE playlist_id = ? AND user_id = ?",
     [playlistId, targetUserId],
   );
+  return true;
 }
 
 async function createPlaylist(
@@ -516,22 +609,23 @@ async function createPlaylist(
   const title = normalizeString(body.title, 100) || "New Playlist";
   const description = normalizeString(body.description, 500);
   const isPublic = parseBoolean(body.is_public, false);
+  const isDefault = parseBoolean(body.is_default, false);
+  const playlistId = crypto.randomUUID();
 
   await queryRows(
     connection,
     `INSERT INTO playlist (id, user_id, title, description, created_in, is_hide, is_default, is_public)
-     VALUES (?, ?, ?, ?, NOW(), 0, 0, ?)`,
-    [crypto.randomUUID(), userId, title, description, isPublic ? 1 : 0],
+     VALUES (?, ?, ?, ?, NOW(), 0, ?, ?)`,
+    [playlistId, userId, title, description, isDefault ? 1 : 0, isPublic ? 1 : 0],
   );
 
   const rows = await queryRows<PlaylistRow>(
     connection,
     `SELECT p.*, 0 AS music_count
      FROM playlist p
-     WHERE p.user_id = ?
-     ORDER BY p.created_in DESC
+     WHERE p.id = ?
      LIMIT 1`,
-    [userId],
+    [playlistId],
   );
 
   const created = rows[0];
@@ -541,6 +635,15 @@ async function createPlaylist(
 
   if (body.metadata && Object.keys(body.metadata).length > 0) {
     await setPlaylistMetadata(connection, created.id, body.metadata);
+  }
+
+  if (isDefault) {
+    await clearFavoritePlaylist(connection, userId);
+    await queryRows(
+      connection,
+      "UPDATE playlist SET is_default = 1, updated_at = NOW() WHERE id = ?",
+      [created.id],
+    );
   }
 
   return created.id;
@@ -582,6 +685,16 @@ async function updatePlaylist(
     params.push(parseBoolean(body.is_hide) ? 1 : 0);
   }
 
+  if (body.is_default !== undefined) {
+    updates.push("is_default = ?");
+    params.push(parseBoolean(body.is_default) ? 1 : 0);
+  }
+
+  if (body.user_id !== undefined) {
+    updates.push("user_id = ?");
+    params.push(normalizeString(body.user_id, 64));
+  }
+
   if (updates.length > 0) {
     updates.push("updated_at = NOW()");
     params.push(playlistId);
@@ -605,6 +718,78 @@ async function deletePlaylist(connection: DbConnection, playlistId: string) {
     "UPDATE playlist SET is_hide = 1, updated_at = NOW() WHERE id = ?",
     [playlistId],
   );
+}
+
+async function restorePlaylist(connection: DbConnection, playlistId: string) {
+  const existing = await queryRows<RowDataPacket & { count: number }>(
+    connection,
+    "SELECT COUNT(*) AS count FROM playlist WHERE id = ?",
+    [playlistId],
+  );
+  if ((existing[0]?.count || 0) === 0) {
+    return false;
+  }
+  await queryRows(
+    connection,
+    "UPDATE playlist SET is_hide = 0, updated_at = NOW() WHERE id = ?",
+    [playlistId],
+  );
+  return true;
+}
+
+async function getAnyPlaylistRow(connection: DbConnection, playlistId: string) {
+  const rows = await queryRows<PlaylistRow>(
+    connection,
+    `SELECT p.*, COUNT(pm.music_id) AS music_count
+     FROM playlist p
+     LEFT JOIN playlist_music pm ON p.id = pm.playlist_id
+     WHERE p.id = ?
+     GROUP BY p.id`,
+    [playlistId],
+  );
+  return rows[0] || null;
+}
+
+async function hardDeletePlaylist(connection: DbConnection, playlistId: string) {
+  const existing = await queryRows<RowDataPacket & { count: number }>(
+    connection,
+    "SELECT COUNT(*) AS count FROM playlist WHERE id = ?",
+    [playlistId],
+  );
+  if ((existing[0]?.count || 0) === 0) {
+    return false;
+  }
+
+  await queryRows(connection, "DELETE FROM playlist_permissions WHERE playlist_id = ?", [playlistId]);
+  await queryRows(connection, "DELETE FROM playlist_metadata WHERE playlist_id = ?", [playlistId]);
+  await queryRows(connection, "DELETE FROM playlist_music WHERE playlist_id = ?", [playlistId]);
+  await queryRows(connection, "DELETE FROM playlist_likes WHERE playlist_id = ?", [playlistId]).catch(() => undefined);
+  await queryRows(connection, "DELETE FROM playlist WHERE id = ?", [playlistId]);
+  return true;
+}
+
+async function getCurrentMembershipTier(connection: DbConnection, userId: string) {
+  const rows = await queryRows<RowDataPacket & { tier: number }>(
+    connection,
+    `SELECT tier
+     FROM users_membership
+     WHERE user = ? AND is_active = 1
+     LIMIT 1`,
+    [userId],
+  );
+  return rows[0]?.tier ?? MembershipTier.FREE;
+}
+
+async function getPublicPlaylistMusicIds(connection: DbConnection) {
+  const rows = await queryRows<RowDataPacket & { music_id: string }>(
+    connection,
+    `SELECT DISTINCT pm.music_id
+     FROM playlist_music pm
+     JOIN playlist p ON p.id = pm.playlist_id
+     WHERE p.is_public = 1 AND p.is_hide = 0
+     ORDER BY pm.music_id ASC`,
+  );
+  return rows.map((row) => row.music_id);
 }
 
 async function addMusicToPlaylist(connection: DbConnection, playlistId: string, musicId: string) {
@@ -663,13 +848,22 @@ playlistRoutes.get("/playlists/mine", async (c) => {
 });
 
 playlistRoutes.get("/playlists", async (c) => {
-  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const session = await optionalSessionFromRequest(c.env, c.req.header("Authorization"));
   const page = parsePositiveInt(c.req.query("page") ?? null, 1, 10000);
-  const limit = parsePositiveInt(c.req.query("limit") ?? null, 24, 100);
+  const limit = parsePositiveInt(c.req.query("limit") ?? null, 20, 100);
+  const includePublic = c.req.query("include_public") === "true";
 
-  const data = await withConnection(c.env, (connection) =>
-    getOwnedPlaylistsPage(connection, session.user.id, page, limit),
-  );
+  const data = await withConnection(c.env, async (connection) => {
+    if (!session) {
+      return getPublicPlaylists(connection, page, limit);
+    }
+
+    const items = await getAccessiblePlaylists(connection, session.user.id, includePublic);
+    return {
+      items,
+      total_count: items.length,
+    };
+  });
   return c.json(success(data));
 });
 
@@ -693,7 +887,7 @@ playlistRoutes.post("/playlist", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as PlaylistCreateBody;
 
   const id = await withConnection(c.env, (connection) => createPlaylist(connection, session.user.id, body));
-  return c.json(success({ id }, "Playlist created"), 201);
+  return c.json(success({ id }, "플레이리스트가 성공적으로 생성되었습니다.", 200), 200);
 });
 
 playlistRoutes.post("/playlist/add", async (c) => {
@@ -706,17 +900,17 @@ playlistRoutes.post("/playlist/add", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const permission = await hasPlaylistPermission(connection, body.playlist_id!, session.user.id, "write");
     if (!permission.playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (!permission.allowed) {
-      throw new HTTPException(403, { message: "Playlist write access denied" });
+      throw new HTTPException(400, { message: "플레이리스트에 음악을 추가할 권한이 없습니다." });
     }
 
     await addMusicToPlaylist(connection, body.playlist_id!, body.music_id!);
-    return { playlist_id: body.playlist_id, music_id: body.music_id, added: true };
+    return {};
   });
 
-  return c.json(success(data, "Music added to playlist"));
+  return c.json(success(data, "음악이 플레이리스트에 추가되었습니다."));
 });
 
 playlistRoutes.post("/playlist/remove", async (c) => {
@@ -729,17 +923,17 @@ playlistRoutes.post("/playlist/remove", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const permission = await hasPlaylistPermission(connection, body.playlist_id!, session.user.id, "write");
     if (!permission.playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (!permission.allowed) {
-      throw new HTTPException(403, { message: "Playlist write access denied" });
+      throw new HTTPException(400, { message: "플레이리스트에서 음악을 제거할 권한이 없습니다." });
     }
 
     await removeMusicFromPlaylist(connection, body.playlist_id!, body.music_id!);
-    return { playlist_id: body.playlist_id, music_id: body.music_id, removed: true };
+    return {};
   });
 
-  return c.json(success(data, "Music removed from playlist"));
+  return c.json(success(data, "음악이 플레이리스트에서 제거되었습니다."));
 });
 
 playlistRoutes.post("/playlist/:id/favorite", async (c) => {
@@ -749,10 +943,10 @@ playlistRoutes.post("/playlist/:id/favorite", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const playlist = await getPlaylistById(connection, playlistId, session, "write");
     if (!playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (playlist.user_id !== session.user.id) {
-      throw new HTTPException(403, { message: "Only the owner can set favorite playlist" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
 
     if (playlist.is_default) {
@@ -773,7 +967,12 @@ playlistRoutes.post("/playlist/:id/favorite", async (c) => {
     return { id: playlistId, is_favorite: true };
   });
 
-  return c.json(success(data, "Favorite playlist updated"));
+  return c.json(
+    success(
+      data,
+      data.is_favorite ? "즐겨찾기 플레이리스트가 설정되었습니다." : "즐겨찾기 플레이리스트가 해제되었습니다.",
+    ),
+  );
 });
 
 playlistRoutes.put("/playlist/:id", async (c) => {
@@ -784,18 +983,17 @@ playlistRoutes.put("/playlist/:id", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const playlist = await getPlaylistById(connection, playlistId, session, "write");
     if (!playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (playlist.user_id !== session.user.id) {
-      throw new HTTPException(403, { message: "Only the owner can update playlist" });
+      throw new HTTPException(400, { message: "플레이리스트를 수정할 권한이 없습니다." });
     }
 
     await updatePlaylist(connection, playlistId, body);
-    const refreshed = await getPlaylistById(connection, playlistId, session, "read");
-    return refreshed;
+    return null;
   });
 
-  return c.json(success(data, "Playlist updated"));
+  return c.json(success(data, "플레이리스트가 성공적으로 수정되었습니다."));
 });
 
 playlistRoutes.delete("/playlist/:id", async (c) => {
@@ -805,17 +1003,73 @@ playlistRoutes.delete("/playlist/:id", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const playlist = await getPlaylistById(connection, playlistId, session, "write");
     if (!playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (playlist.user_id !== session.user.id) {
-      throw new HTTPException(403, { message: "Only the owner can delete playlist" });
+      throw new HTTPException(400, { message: "플레이리스트를 삭제할 권한이 없습니다." });
     }
 
     await deletePlaylist(connection, playlistId);
-    return { id: playlistId, deleted: true };
+    return null;
   });
 
-  return c.json(success(data, "Playlist deleted"));
+  return c.json(success(data, "플레이리스트가 성공적으로 삭제되었습니다."));
+});
+
+playlistRoutes.post("/playlist/:id/restore", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const playlistId = c.req.param("id");
+
+  const data = await withConnection(c.env, async (connection) => {
+    const playlist = await getAnyPlaylistRow(connection, playlistId);
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+
+    if (playlist.user_id !== session.user.id) {
+      const permissionRows = await queryRows<PermissionRow>(
+        connection,
+        `SELECT user_id, permission_type
+         FROM playlist_permissions
+         WHERE playlist_id = ?
+           AND user_id = ?
+           AND (expires_at IS NULL OR expires_at > NOW())
+         LIMIT 1`,
+        [playlistId, session.user.id],
+      );
+      const level = permissionRows[0]?.permission_type;
+      if (level !== "admin") {
+        throw new HTTPException(400, { message: "플레이리스트를 복구할 권한이 없습니다." });
+      }
+    }
+
+    const restored = await restorePlaylist(connection, playlistId);
+    if (!restored) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    return null;
+  });
+
+  return c.json(success(data, "플레이리스트가 성공적으로 복구되었습니다."));
+});
+
+playlistRoutes.delete("/playlist/:id/hard", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const playlistId = c.req.param("id");
+
+  const data = await withConnection(c.env, async (connection) => {
+    const tier = await getCurrentMembershipTier(connection, session.user.id);
+    if (tier !== MembershipTier.DEV) {
+      throw new HTTPException(400, { message: "영구 삭제는 dev 권한이 필요합니다." });
+    }
+    const removed = await hardDeletePlaylist(connection, playlistId);
+    if (!removed) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    return null;
+  });
+
+  return c.json(success(data, "플레이리스트가 영구적으로 삭제되었습니다."));
 });
 
 playlistRoutes.put("/playlist/:id/music/:musicId/custom-title", async (c) => {
@@ -825,9 +1079,15 @@ playlistRoutes.put("/playlist/:id/music/:musicId/custom-title", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CustomTitleBody;
 
   const data = await withConnection(c.env, async (connection) => {
-    const playlist = await getPlaylistById(connection, playlistId, session, "write");
+    const playlist = await getPlaylistById(
+      connection,
+      playlistId,
+      session,
+      "write",
+      "플레이리스트를 수정할 권한이 없습니다.",
+    );
     if (!playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
 
     const customTitle = await setCustomTitle(
@@ -844,7 +1104,9 @@ playlistRoutes.put("/playlist/:id/music/:musicId/custom-title", async (c) => {
     };
   });
 
-  return c.json(success(data, data.custom_title ? "Custom title updated" : "Custom title reset"));
+  return c.json(
+    success(data, data.custom_title ? "곡 제목이 변경되었습니다." : "곡 제목이 원본으로 복원되었습니다."),
+  );
 });
 
 playlistRoutes.get("/playlist/:id/permissions", async (c) => {
@@ -852,7 +1114,16 @@ playlistRoutes.get("/playlist/:id/permissions", async (c) => {
   const playlistId = c.req.param("id");
 
   const data = await withConnection(c.env, async (connection) => {
-    await getPlaylistById(connection, playlistId, session, "admin");
+    const playlist = await getPlaylistById(
+      connection,
+      playlistId,
+      session,
+      "admin",
+      "권한 목록을 조회할 수 있는 권한이 없습니다.",
+    );
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
     const items = await getPlaylistPermissions(connection, playlistId);
     return { items };
   });
@@ -870,7 +1141,10 @@ playlistRoutes.post("/playlist/:id/permissions", async (c) => {
   }
 
   const data = await withConnection(c.env, async (connection) => {
-    await getPlaylistById(connection, playlistId, session, "admin");
+    const playlist = await getPlaylistById(connection, playlistId, session, "admin");
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
     const permissionId = await grantPlaylistPermission(
       connection,
       playlistId,
@@ -882,7 +1156,7 @@ playlistRoutes.post("/playlist/:id/permissions", async (c) => {
     return { permission_id: permissionId };
   });
 
-  return c.json(success(data, "Permission granted"));
+  return c.json(success(data, "권한이 성공적으로 부여되었습니다."));
 });
 
 playlistRoutes.delete("/playlist/:id/permissions", async (c) => {
@@ -895,12 +1169,93 @@ playlistRoutes.delete("/playlist/:id/permissions", async (c) => {
   }
 
   const data = await withConnection(c.env, async (connection) => {
-    await getPlaylistById(connection, playlistId, session, "admin");
-    await revokePlaylistPermission(connection, playlistId, body.user_id!);
+    const playlist = await getPlaylistById(connection, playlistId, session, "admin");
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    const revoked = await revokePlaylistPermission(connection, playlistId, body.user_id!);
+    if (!revoked) {
+      throw new HTTPException(404, { message: "권한을 찾을 수 없습니다." });
+    }
     return null;
   });
 
-  return c.json(success(data, "Permission revoked"));
+  return c.json(success(data, "권한이 성공적으로 취소되었습니다."));
+});
+
+playlistRoutes.post("/playlist/:id/metadata", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const playlistId = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as { metadata?: Record<string, string> };
+
+  if (!body.metadata || typeof body.metadata !== "object") {
+    throw new HTTPException(400, { message: "metadata 객체가 필요합니다." });
+  }
+
+  const data = await withConnection(c.env, async (connection) => {
+    const playlist = await getPlaylistById(
+      connection,
+      playlistId,
+      session,
+      "admin",
+      "플레이리스트 메타데이터를 수정할 권한이 없습니다.",
+    );
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    await setPlaylistMetadata(connection, playlistId, body.metadata || {});
+    return null;
+  });
+
+  return c.json(success(data, "메타데이터가 성공적으로 저장되었습니다."));
+});
+
+playlistRoutes.get("/playlist/:id/metadata", async (c) => {
+  const playlistId = c.req.param("id");
+  const session = await optionalSessionFromRequest(c.env, c.req.header("Authorization"));
+
+  const data = await withConnection(c.env, async (connection) => {
+    const playlist = await getPlaylistById(
+      connection,
+      playlistId,
+      session,
+      "read",
+      "플레이리스트 메타데이터를 조회할 권한이 없습니다.",
+    );
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    const metadata = await getPlaylistMetadata(connection, playlistId);
+    return { metadata };
+  });
+
+  return c.json(success(data));
+});
+
+playlistRoutes.delete("/playlist/:id/metadata/:key", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const playlistId = c.req.param("id");
+  const key = c.req.param("key");
+
+  const data = await withConnection(c.env, async (connection) => {
+    const playlist = await getPlaylistById(
+      connection,
+      playlistId,
+      session,
+      "admin",
+      "플레이리스트 메타데이터를 삭제할 권한이 없습니다.",
+    );
+    if (!playlist) {
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
+    }
+    const removed = await deletePlaylistMetadata(connection, playlistId, key);
+    if (!removed) {
+      throw new HTTPException(404, { message: "메타데이터를 찾을 수 없습니다." });
+    }
+    return null;
+  });
+
+  return c.json(success(data, "메타데이터가 성공적으로 삭제되었습니다."));
 });
 
 playlistRoutes.put("/v2/playlist/:id/cover", async (c) => {
@@ -916,10 +1271,10 @@ playlistRoutes.put("/v2/playlist/:id/cover", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const playlist = await getPlaylistById(connection, playlistId, session, "write");
     if (!playlist) {
-      throw new HTTPException(404, { message: "Playlist not found" });
+      throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
     }
     if (playlist.user_id !== session.user.id) {
-      throw new HTTPException(403, { message: "Only the owner can update cover image" });
+      throw new HTTPException(400, { message: "플레이리스트를 수정할 권한이 없습니다." });
     }
 
     await setPlaylistMetadata(connection, playlistId, {
@@ -929,7 +1284,7 @@ playlistRoutes.put("/v2/playlist/:id/cover", async (c) => {
     return { cover_image_url: coverImageUrl };
   });
 
-  return c.json(success(data, "Cover image updated"));
+  return c.json(success(data, "커버 이미지가 성공적으로 업데이트되었습니다."));
 });
 
 playlistRoutes.get("/playlist/:id", async (c) => {
@@ -938,7 +1293,7 @@ playlistRoutes.get("/playlist/:id", async (c) => {
 
   const data = await withConnection(c.env, (connection) => getPlaylistById(connection, id, session));
   if (!data) {
-    throw new HTTPException(404, { message: "Playlist not found" });
+    throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
   }
 
   return c.json(success(data));
@@ -946,7 +1301,21 @@ playlistRoutes.get("/playlist/:id", async (c) => {
 
 playlistRoutes.get("/playlist/:id/musics", async (c) => {
   const id = c.req.param("id");
-  const page = parsePositiveInt(c.req.query("page") ?? null, 1, 10000);
+  if (!id || id === "null" || id === "undefined") {
+    return c.json(
+      success(
+        {
+          items: [],
+          count: 0,
+          total_count: 0,
+          current_page: 1,
+          total_pages: 0,
+        },
+        "플레이리스트가 선택되지 않았습니다.",
+      ),
+    );
+  }
+  const page = parsePositiveInt(c.req.query("p") ?? c.req.query("page") ?? null, 1, 10000);
   const limit = parsePositiveInt(c.req.query("limit") ?? null, 20, 100);
   const session = await optionalSessionFromRequest(c.env, c.req.header("Authorization"));
 
@@ -954,8 +1323,23 @@ playlistRoutes.get("/playlist/:id/musics", async (c) => {
     getPlaylistMusics(connection, id, page, limit, session),
   );
   if (!data) {
-    throw new HTTPException(404, { message: "Playlist not found" });
+    throw new HTTPException(404, { message: "플레이리스트를 찾을 수 없습니다." });
   }
+
+  return c.json(success(data));
+});
+
+playlistRoutes.get("/playlist/publicItems", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const data = await withConnection(c.env, async (connection) => {
+    const tier = await getCurrentMembershipTier(connection, session.user.id);
+    if (tier !== MembershipTier.DEV) {
+      throw new HTTPException(400, { message: "dev 권한이 필요합니다." });
+    }
+
+    const musicIds = await getPublicPlaylistMusicIds(connection);
+    return { music_ids: musicIds };
+  });
 
   return c.json(success(data));
 });

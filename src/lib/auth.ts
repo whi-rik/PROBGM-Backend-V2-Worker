@@ -3,6 +3,7 @@ import { HTTPException } from "hono/http-exception";
 import type { RowDataPacket } from "mysql2/promise";
 import type { Bindings } from "../env";
 import { queryRows, withConnection, type DbConnection } from "./db";
+import { legacyAuthFailure } from "./response";
 
 interface SessionRow extends RowDataPacket {
   user_id: string;
@@ -546,12 +547,40 @@ export async function requireSessionFromRequest(
 ): Promise<AuthSession> {
   const token = extractBearerToken(authorizationHeader);
   if (!token) {
-    throw new HTTPException(401, { message: "Authorization header is required" });
+    throw new HTTPException(401, {
+      res: new Response(
+        JSON.stringify(
+          legacyAuthFailure(
+            "Authorization header is required",
+            "MISSING_AUTH_HEADER",
+            "Unauthorized: Service denied 1043",
+          ),
+        ),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        },
+      ),
+    });
   }
 
   const session = await validateSession(env, token);
   if (!session) {
-    throw new HTTPException(401, { message: "Invalid or expired session" });
+    throw new HTTPException(401, {
+      res: new Response(
+        JSON.stringify(
+          legacyAuthFailure(
+            "Invalid or expired session",
+            "TOKEN_EXPIRED",
+            "Unauthorized: Service denied 1052",
+          ),
+        ),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        },
+      ),
+    });
   }
 
   return session;

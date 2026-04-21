@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy this file and replace every placeholder before using with smoke:write.",
+  "paymentKey": "pay_placeholder_replace_me",
+  "orderId": "order_placeholder_replace_me",
+  "amount": 10000,
+  "originalAmount": 10000,
+  "membershipPlan": "PRO_MONTHLY",
+  "promotionCode": ""
+}

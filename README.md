@@ -218,6 +218,25 @@ SMOKE_PASSWORD=secret \
 npm run smoke:live
 ```
 
+Write smoke:
+
+```bash
+BASE_URL=https://your-worker.example.com \
+SMOKE_EMAIL=user@example.com \
+SMOKE_PASSWORD=secret \
+npm run smoke:write
+```
+
+Write compare:
+
+```bash
+LEGACY_BASE_URL=https://legacy.example.com \
+WORKER_BASE_URL=https://worker.example.com \
+COMPARE_EMAIL=user@example.com \
+COMPARE_PASSWORD=secret \
+npm run compare:write
+```
+
 Admin payment smoke:
 
 ```bash
@@ -225,6 +244,16 @@ BASE_URL=https://your-worker.example.com \
 SMOKE_ADMIN_EMAIL=admin@example.com \
 SMOKE_ADMIN_PASSWORD=secret \
 npm run smoke:admin
+```
+
+Legacy vs Worker contract compare:
+
+```bash
+LEGACY_BASE_URL=https://legacy.example.com \
+WORKER_BASE_URL=https://worker.example.com \
+COMPARE_AUTH_TOKEN=<ssid> \
+COMPARE_USER_AGENT='contract-compare' \
+npm run compare:contract
 ```
 
 Optional promotion usage check:
@@ -247,7 +276,13 @@ npm run smoke:admin
 - [docs/provider-decision-record-template.md](./docs/provider-decision-record-template.md)
 - [docs/provider-decision-record-draft.md](./docs/provider-decision-record-draft.md)
 - [docs/staging-execution-checklist.md](./docs/staging-execution-checklist.md)
+- [docs/staging-write-checklist.md](./docs/staging-write-checklist.md)
+- [docs/write-compare-runbook.md](./docs/write-compare-runbook.md)
 - [docs/implementation-coverage.md](./docs/implementation-coverage.md)
+- [docs/contract-parity-gaps.md](./docs/contract-parity-gaps.md)
+- [docs/contract-compare-runbook.md](./docs/contract-compare-runbook.md)
+- [docs/e2e-contract-check-2026-04-21.md](./docs/e2e-contract-check-2026-04-21.md)
+- [docs/write-e2e-check-2026-04-21.md](./docs/write-e2e-check-2026-04-21.md)
 - [docs/admin-incident-runbook.md](./docs/admin-incident-runbook.md)
 - [docs/parity-matrix.md](./docs/parity-matrix.md)
 - [docs/cutover-readiness.md](./docs/cutover-readiness.md)

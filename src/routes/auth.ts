@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
+import type { RowDataPacket } from "mysql2/promise";
 import type { Bindings } from "../env";
 import {
   checkNewbieStatus,
@@ -23,6 +24,7 @@ import {
   normalizeEmail,
   verifyOtpCode,
 } from "../lib/otp";
+import { queryRows, withConnection } from "../lib/db";
 import { success } from "../lib/response";
 
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
@@ -37,23 +39,24 @@ authRoutes.post("/register", async (c) => {
     email?: string;
     password?: string;
     provider?: string;
+    social_id?: string;
   }));
 
   const provider = body.provider || "local";
   const username = (body.username || "").trim();
   if (provider === "local") {
     if (!body.email || !body.password) {
-      throw new HTTPException(400, { message: "email and password are required" });
+      throw new HTTPException(400, { message: "Email and password are required for local registration" });
     }
     if (!username) {
-      throw new HTTPException(400, { message: "username is required" });
+      throw new HTTPException(400, { message: "Username is required" });
     }
   } else if (isSocialProvider(provider)) {
     if (!body.social_id || !username) {
       throw new HTTPException(400, { message: "social_id and username are required for social registration" });
     }
   } else {
-    throw new HTTPException(400, { message: "Unsupported provider" });
+    throw new HTTPException(400, { message: "Invalid provider" });
   }
 
   const user =
@@ -72,7 +75,14 @@ authRoutes.post("/register", async (c) => {
           body.email ? String(body.email).trim().toLowerCase() : null,
         );
 
-  return c.json(success(user, "Registered"), 201);
+  return c.json(
+    success(
+      user,
+      `${provider === "local" ? "회원가입" : "소셜 회원가입"}이 완료되었습니다.`,
+      201,
+    ),
+    201,
+  );
 });
 
 authRoutes.post("/verify", async (c) => {
@@ -80,38 +90,68 @@ authRoutes.post("/verify", async (c) => {
   if (!body.identifier || !body.provider) {
     throw new HTTPException(400, { message: "identifier and provider are required" });
   }
-  let session;
-  if (body.provider === "local") {
-    if (!body.credential) {
-      throw new HTTPException(400, { message: "credential is required for local login" });
+  try {
+    let session;
+    if (body.provider === "local") {
+      if (!body.credential) {
+        throw new HTTPException(400, { message: "credential is required for local login" });
+      }
+
+      session = await verifyLocalUser(
+        c.env,
+        String(body.identifier).trim().toLowerCase(),
+        String(body.credential),
+        c.req.raw.headers,
+      );
+    } else if (isSocialProvider(body.provider)) {
+      session = await verifySocialUser(
+        c.env,
+        String(body.provider),
+        String(body.identifier).trim(),
+        c.req.raw.headers,
+      );
+    } else {
+      throw new HTTPException(400, { message: "Invalid provider" });
     }
 
-    session = await verifyLocalUser(
-      c.env,
-      String(body.identifier).trim().toLowerCase(),
-      String(body.credential),
-      c.req.raw.headers,
+    return c.json(
+      success(
+        {
+          id: session.user.id,
+          ssid: session.ssid,
+          name: session.user.username,
+          email: session.user.email || "",
+          provider: session.user.provider,
+        },
+        `${body.provider === "local" ? "로그인" : "소셜 로그인"}에 성공했습니다.`,
+      ),
     );
-  } else if (isSocialProvider(body.provider)) {
-    session = await verifySocialUser(
-      c.env,
-      String(body.provider),
-      String(body.identifier).trim(),
-      c.req.raw.headers,
-    );
-  } else {
-    throw new HTTPException(400, { message: "Unsupported provider" });
-  }
+  } catch (error) {
+    if (
+      body.provider &&
+      body.provider !== "local" &&
+      error instanceof HTTPException &&
+      error.status === 404
+    ) {
+      return c.json(
+        {
+          success: false,
+          message: `${body.provider} 계정을 찾을 수 없습니다. 먼저 회원가입을 진행해주세요.`,
+          statusCode: 404,
+          code: "SOCIAL_USER_NOT_FOUND",
+          data: {
+            provider: body.provider,
+            socialId: String(body.identifier).trim(),
+            shouldRegister: true,
+          },
+          timestamp: new Date().toISOString(),
+        },
+        404,
+      );
+    }
 
-  return c.json(
-    success({
-      id: session.user.id,
-      ssid: session.ssid,
-      name: session.user.username,
-      email: session.user.email || "",
-      provider: session.user.provider,
-    }),
-  );
+    throw error;
+  }
 });
 
 authRoutes.post("/social/callback", async (c) => {
@@ -152,7 +192,7 @@ authRoutes.post("/social/callback", async (c) => {
           ssid: session.ssid,
           registered: false,
         },
-        "Social login successful",
+        "소셜 로그인에 성공했습니다.",
       ),
     );
   } catch (error) {
@@ -181,7 +221,8 @@ authRoutes.post("/social/callback", async (c) => {
           ssid,
           registered: true,
         },
-        "Social registration and login successful",
+        "소셜 회원가입이 완료되었습니다.",
+        201,
       ),
       201,
     );
@@ -209,7 +250,7 @@ authRoutes.post("/login", async (c) => {
         email: session.user.email,
         provider: session.user.provider,
       },
-      "Logged in",
+      "로그인에 성공했습니다.",
     ),
   );
 });
@@ -217,87 +258,110 @@ authRoutes.post("/login", async (c) => {
 authRoutes.get("/me", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   return c.json(
-    success({
-      id: session.user.id,
-      username: session.user.username,
-      email: session.user.email,
-      provider: session.user.provider,
-      is_newbie: session.user.is_newbie,
-      created_at: session.user.created_at,
-    }),
+    success(
+      {
+        id: session.user.id,
+        username: session.user.username,
+        email: session.user.email,
+        provider: session.user.provider,
+        isNewbie: session.user.is_newbie,
+      },
+      "사용자 정보를 성공적으로 가져왔습니다.",
+    ),
   );
 });
 
 authRoutes.get("/isLogged", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   return c.json(
-    success({
-      id: session.user.id,
-      username: session.user.username,
-      email: session.user.email,
-      provider: session.user.provider,
-      isNewbie: session.user.is_newbie,
-      created_at: session.user.created_at,
-    }),
+    success(
+      {
+        id: session.user.id,
+        username: session.user.username,
+        email: session.user.email,
+        provider: session.user.provider,
+        isNewbie: session.user.is_newbie,
+      },
+      "사용자 정보를 성공적으로 가져왔습니다.",
+    ),
   );
 });
 
 authRoutes.get("/check", async (c) => {
   await requireSessionFromRequest(c.env, c.req.header("Authorization"));
-  return c.json(success({ authenticated: true }, "Authentication checked"));
+  return c.json(success({ authenticated: true }, "인증 상태가 확인되었습니다."));
 });
 
 authRoutes.post("/signout", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
-  const ok = await signOutSession(c.env, session.ssid);
-  if (!ok) {
-    throw new HTTPException(404, { message: "Session not found" });
-  }
+  await signOutSession(c.env, session.ssid);
 
-  return c.json(success({ success: true }, "Signed out"));
+  return c.json(success(null, "로그아웃되었습니다."));
 });
 
 authRoutes.post("/logout", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
-  const ok = await signOutSession(c.env, session.ssid);
-  if (!ok) {
-    throw new HTTPException(404, { message: "Session not found" });
-  }
+  await signOutSession(c.env, session.ssid);
 
-  return c.json(success(null, "Signed out"));
+  return c.json(success(null, "로그아웃되었습니다."));
 });
 
 authRoutes.post("/refresh", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const newSsid = await refreshSession(c.env, session.ssid, session.user.id, c.req.raw.headers);
-  return c.json(success({ refreshed: true, ssid: newSsid }, "Session refreshed"));
+  return c.json(success({ refreshed: true, ssid: newSsid }, "세션이 갱신되었습니다."));
 });
 
 authRoutes.get("/newbie/check", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const isNewbie = await checkNewbieStatus(c.env, session.user.id);
-  return c.json(success({ isNewbie, userId: session.user.id }));
+  return c.json(
+    success(
+      { isNewbie, userId: session.user.id },
+      isNewbie ? "새로운 사용자입니다." : "기존 사용자입니다.",
+    ),
+  );
 });
 
 authRoutes.post("/newbie/confirm", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   await confirmNewbieStatus(c.env, session.user.id);
-  return c.json(success({ confirmed: true, userId: session.user.id }, "Newbie confirmed"));
+  return c.json(success({ confirmed: true, userId: session.user.id }, "새로운 사용자 확인이 완료되었습니다."));
 });
 
 authRoutes.post("/otp/check-email", async (c) => {
   const body = await c.req.json().catch(() => ({} as { email?: string }));
   if (!body.email) {
-    throw new HTTPException(400, { message: "email is required" });
+    throw new HTTPException(400, { message: "Email is required" });
   }
 
-  const result = await checkEmailExists(c.env, normalizeEmail(body.email));
+  const normalizedEmail = normalizeEmail(body.email);
+  const result = await checkEmailExists(c.env, normalizedEmail);
+  if (result.exists) {
+    return c.json(
+      success(
+        {
+          available: false,
+          email: normalizedEmail,
+          existingProvider: result.provider,
+          message:
+            result.provider === "otp"
+              ? "Email already registered. Please login instead."
+              : `Email already registered with ${result.provider}. Please login with ${result.provider} or use a different email.`,
+        },
+        "Email is not available",
+      ),
+    );
+  }
+
   return c.json(
-    success({
-      available: !result.exists,
-      exists: result.exists,
-      provider: result.provider,
-    }),
+    success(
+      {
+        available: true,
+        email: normalizedEmail,
+      },
+      "Email is available",
+    ),
   );
 });
 
@@ -307,7 +371,7 @@ async function buildOtpRequestResponse(
 ) {
   const body = await c.req.json().catch(() => ({} as { email?: string }));
   if (!body.email) {
-    throw new HTTPException(400, { message: "email is required" });
+    throw new HTTPException(400, { message: "Email is required" });
   }
 
   const result = await createAndStoreOtp(c.env, {
@@ -333,8 +397,11 @@ authRoutes.post("/otp/login/request", async (c) => buildOtpRequestResponse(c, "l
 
 authRoutes.post("/otp/register/verify", async (c) => {
   const body = await c.req.json().catch(() => ({} as { email?: string; otpCode?: string; username?: string }));
-  if (!body.email || !body.otpCode || !body.username?.trim()) {
-    throw new HTTPException(400, { message: "email, otpCode, and username are required" });
+  if (!body.email || !body.otpCode) {
+    throw new HTTPException(400, { message: "Email and OTP code are required" });
+  }
+  if (!body.username?.trim()) {
+    throw new HTTPException(400, { message: "Username is required for registration" });
   }
 
   const email = normalizeEmail(body.email);
@@ -372,7 +439,7 @@ authRoutes.post("/otp/register/verify", async (c) => {
 authRoutes.post("/otp/login/verify", async (c) => {
   const body = await c.req.json().catch(() => ({} as { email?: string; otpCode?: string }));
   if (!body.email || !body.otpCode) {
-    throw new HTTPException(400, { message: "email and otpCode are required" });
+    throw new HTTPException(400, { message: "Email and OTP code are required" });
   }
 
   const email = normalizeEmail(body.email);
@@ -408,8 +475,11 @@ authRoutes.post("/otp/login/verify", async (c) => {
 
 authRoutes.post("/otp/resend", async (c) => {
   const body = await c.req.json().catch(() => ({} as { email?: string; purpose?: "register" | "login" }));
-  if (!body.email || !body.purpose || !["register", "login"].includes(body.purpose)) {
-    throw new HTTPException(400, { message: "email and valid purpose are required" });
+  if (!body.email || !body.purpose) {
+    throw new HTTPException(400, { message: "Email and purpose are required" });
+  }
+  if (!["register", "login"].includes(body.purpose)) {
+    throw new HTTPException(400, { message: 'Invalid purpose. Must be "register" or "login"' });
   }
 
   const result = await createAndStoreOtp(c.env, {
@@ -434,8 +504,11 @@ authRoutes.post("/otp/verify", async (c) => {
   const body = await c.req.json().catch(
     () => ({} as { email?: string; otpCode?: string; purpose?: "register" | "login" }),
   );
-  if (!body.email || !body.otpCode || !body.purpose || !["register", "login"].includes(body.purpose)) {
-    throw new HTTPException(400, { message: "email, otpCode, and valid purpose are required" });
+  if (!body.email || !body.otpCode || !body.purpose) {
+    throw new HTTPException(400, { message: "Email, OTP code, and purpose are required" });
+  }
+  if (!["register", "login"].includes(body.purpose)) {
+    throw new HTTPException(400, { message: 'Invalid purpose. Must be "register" or "login"' });
   }
 
   const result = await verifyOtpCode(c.env, {
@@ -445,4 +518,35 @@ authRoutes.post("/otp/verify", async (c) => {
   });
 
   return c.json(success({ verified: true, email: result.email }, "Verification code is valid"));
+});
+
+authRoutes.get("/otp/stats", async (c) => {
+  await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const stats = await withConnection(c.env, async (connection) => {
+    const [totals, byPurpose] = await Promise.all([
+      queryRows<RowDataPacket & { total: number; verified: number; used: number }>(
+        connection,
+        `SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN is_verified = 1 THEN 1 ELSE 0 END) AS verified,
+            SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used
+         FROM otp_codes`,
+      ),
+      queryRows<RowDataPacket & { purpose: string; count: number }>(
+        connection,
+        `SELECT purpose, COUNT(*) AS count
+         FROM otp_codes
+         GROUP BY purpose`,
+      ),
+    ]);
+
+    return {
+      total: totals[0]?.total || 0,
+      verified: totals[0]?.verified || 0,
+      used: totals[0]?.used || 0,
+      byPurpose: Object.fromEntries(byPurpose.map((row) => [row.purpose, row.count])),
+    };
+  });
+
+  return c.json(success({ stats }, "OTP statistics retrieved successfully"));
 });

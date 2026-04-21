@@ -7,9 +7,12 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "compare:contract": "node ./scripts/compare-contract.mjs",
+    "compare:write": "bash ./scripts/compare-write.sh",
     "smoke:provider": "bash ./scripts/provider-smoke.sh",
     "smoke:live": "bash ./scripts/smoke-live.sh",
-    "smoke:admin": "bash ./scripts/smoke-admin.sh"
+    "smoke:admin": "bash ./scripts/smoke-admin.sh",
+    "smoke:write": "bash ./scripts/smoke-write.sh"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

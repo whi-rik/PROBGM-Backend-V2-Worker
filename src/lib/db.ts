@@ -86,6 +86,7 @@ async function createMysqlConnection(env: Bindings): Promise<DbConnection> {
         database: env.HYPERDRIVE.database,
         disableEval: true,
         charset: "utf8mb4",
+        timezone: "Z",
       }
     : {
         host: env.DB_HOST,
@@ -95,6 +96,7 @@ async function createMysqlConnection(env: Bindings): Promise<DbConnection> {
         database: env.DB_NAME,
         disableEval: true,
         charset: "utf8mb4",
+        timezone: "Z",
       };
 
   if (!config.host || !config.user || !config.database) {
@@ -228,16 +230,16 @@ export async function pingDatabase(env: Bindings): Promise<{
 
   try {
     const result = await withConnection(env, async (connection) => {
-      const rows = await queryRows<RowDataPacket & { value?: number; current_time?: string | Date }>(
+      const rows = await queryRows<RowDataPacket & { value?: number; current_ts?: string | Date }>(
         connection,
-        "SELECT 1 AS value, CURRENT_TIMESTAMP AS current_time",
+        "SELECT 1 AS value, CURRENT_TIMESTAMP AS current_ts",
       );
       const row = rows[0];
       const currentTime =
-        row?.current_time instanceof Date
-          ? row.current_time.toISOString()
-          : typeof row?.current_time === "string"
-            ? row.current_time
+        row?.current_ts instanceof Date
+          ? row.current_ts.toISOString()
+          : typeof row?.current_ts === "string"
+            ? row.current_ts
             : null;
 
       return {

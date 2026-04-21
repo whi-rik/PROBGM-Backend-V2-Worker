@@ -23,6 +23,8 @@ Completed:
 - Toss confirm/cancel/webhook flows
 - R2 upload flow
 - mysql/postgres/d1 runtime switching
+- local read-side contract compare on tested frontend-critical endpoints
+- local safe write-side E2E for playlist/account flows
 
 Remaining:
 - live provider parity verification against real schema
@@ -45,6 +47,8 @@ Completed:
 - optional webhook audit table
 - admin failed payment inspection
 - admin webhook audit inspection
+- local validation parity check for `payments/confirm`
+- local validation parity check for `billing/issue-key`
 
 Remaining:
 - webhook replay/retry strategy
@@ -66,6 +70,7 @@ Completed:
 - user profile and username update
 - social bind/unbind
 - account delete
+- local username update write E2E verified across legacy/worker reads
 
 Remaining:
 - provider-specific OAuth code exchange if the edge layer needs to own it
@@ -107,6 +112,7 @@ Completed:
 - `/health/schema`
 - Worker-native upload to R2
 - optional SQL upload metadata persistence
+- UTC/MySQL datetime parity verified locally for playlist write/read checks
 
 Remaining:
 - real-provider smoke against mysql/postgres/d1
@@ -150,6 +156,9 @@ Completed:
 - cutover readiness checklist
 - provider/runtime health diagnostics
 - authenticated live smoke script
+- safe write smoke script
+- write compare runbook
+- local read/write E2E notes
 
 Remaining:
 - staging traffic verification with real frontend and DB
@@ -158,7 +167,7 @@ Remaining:
 
 ## Immediate next priorities
 
-1. live DB provider verification matrix for mysql/postgres/d1
-2. upload metadata and webhook audit SQL schema docs/examples
-3. remaining admin parity routes
-4. staging verification for payment/admin inspection
+1. staging execution of `smoke:provider`, `smoke:live`, `smoke:admin`, `smoke:write`
+2. staging payment/billing live write verification using fixture bodies
+3. live DB provider verification matrix for mysql/postgres/d1
+4. upload metadata and webhook audit SQL schema docs/examples

@@ -5,7 +5,7 @@ import type { Bindings } from "../env";
 import { requireAdminSessionFromRequest } from "../lib/admin";
 import { requireSessionFromRequest } from "../lib/auth";
 import { placeholders, queryRows, withConnection, type DbConnection } from "../lib/db";
-import { success } from "../lib/response";
+import { legacyValidationFailure, success } from "../lib/response";
 import { applyMembershipByOrderName } from "../lib/membership";
 import { recordPromotionCodeUse, validatePromotionCodeOrThrow } from "../lib/promotion";
 import { cancelPaymentWithToss, confirmPaymentWithToss } from "../lib/toss";
@@ -86,6 +86,25 @@ interface TossWebhookPayload {
   };
 }
 
+interface CreatePaymentBody {
+  orderId?: string;
+  orderName?: string;
+  amount?: number;
+  currency?: string;
+  method?: string;
+  customerEmail?: string;
+  customerName?: string;
+  customerMobilePhone?: string;
+  successUrl?: string;
+  failUrl?: string;
+  isBilling?: boolean;
+  billingCycle?: string;
+  billingDay?: number;
+  paymentMethods?: string[];
+  originalAmount?: number;
+  metadata?: Record<string, unknown>;
+}
+
 function getWebhookAuditTableName(env: Bindings) {
   const table = (env.PAYMENT_WEBHOOK_AUDIT_TABLE || "").trim();
   if (!table) {
@@ -120,6 +139,34 @@ function parseDateTimeFilter(value: string | null, fieldName: string): string | 
   return new Date(timestamp).toISOString();
 }
 
+function calculateNextBillingDate(
+  cycleType: "MONTHLY" | "YEARLY",
+  billingDay: number,
+  fromDate: Date = new Date(),
+) {
+  if (cycleType === "MONTHLY") {
+    const nextDate = new Date(fromDate);
+    nextDate.setDate(billingDay);
+    if (nextDate <= fromDate) {
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      nextDate.setDate(billingDay);
+    }
+    if (nextDate.getDate() !== billingDay) {
+      nextDate.setDate(0);
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      nextDate.setDate(0);
+    }
+    return nextDate;
+  }
+
+  const currentYear = fromDate.getFullYear();
+  const nextDate = new Date(currentYear, 0, billingDay);
+  if (nextDate <= fromDate) {
+    nextDate.setFullYear(currentYear + 1);
+  }
+  return nextDate;
+}
+
 function parseJsonField<T>(value: string | null): T | null {
   if (!value) {
     return null;
@@ -144,6 +191,47 @@ function mapCancellationRecord(row: PaymentCancellationRow) {
   return {
     ...row,
     toss_cancel_data: parseJsonField<Record<string, unknown>>(row.toss_cancel_data),
+  };
+}
+
+function formatPaymentForLegacyResponse(row: PaymentRow) {
+  return {
+    id: row.id,
+    paymentKey: row.payment_key,
+    orderId: row.order_id,
+    orderName: row.order_name,
+    userId: row.user_id,
+    customerKey: row.customer_key,
+    amount: row.amount,
+    currency: row.currency,
+    method: row.method,
+    status: row.status,
+    isBilling: Boolean(row.is_billing),
+    billingCycle: row.billing_cycle,
+    billingKey: row.billing_key ? "***masked***" : null,
+    nextBillingDate: row.next_billing_date,
+    tossPaymentData: parseJsonField<Record<string, unknown>>(row.toss_payment_data),
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function formatCancellationForLegacyResponse(row: PaymentCancellationRow) {
+  return {
+    id: row.id,
+    paymentId: row.payment_id,
+    paymentKey: row.payment_key,
+    cancelAmount: row.cancel_amount,
+    cancelReason: row.cancel_reason,
+    cancellationType: row.cancellation_type,
+    status: row.status,
+    transactionKey: row.transaction_key,
+    requestedBy: row.requested_by,
+    approvedBy: row.approved_by,
+    requestedAt: row.requested_at,
+    approvedAt: row.approved_at,
+    tossCancelData: parseJsonField<Record<string, unknown>>(row.toss_cancel_data),
   };
 }
 
@@ -309,8 +397,8 @@ async function getPaymentCancellationsForKey(connection: DbConnection, paymentKe
   );
 
   return {
-    payment: mapPaymentRecord(payment),
-    cancellations: rows.map(mapCancellationRecord),
+    payment,
+    cancellations: rows,
   };
 }
 
@@ -417,6 +505,8 @@ async function listPaymentsForUser(
   limit: number,
   status: string | null,
   method: string | null,
+  dateFrom: string | null,
+  dateTo: string | null,
 ) {
   const offset = (page - 1) * limit;
   const whereConditions = ["user_id = ?"];
@@ -430,6 +520,16 @@ async function listPaymentsForUser(
   if (method) {
     whereConditions.push("method = ?");
     whereValues.push(method);
+  }
+
+  if (dateFrom) {
+    whereConditions.push("created_at >= ?");
+    whereValues.push(dateFrom);
+  }
+
+  if (dateTo) {
+    whereConditions.push("created_at <= ?");
+    whereValues.push(dateTo);
   }
 
   const whereClause = `WHERE ${whereConditions.join(" AND ")}`;
@@ -572,22 +672,145 @@ async function listPaymentsForAdmin(
 
 export const paymentRoutes = new Hono<{ Bindings: Bindings }>();
 
+paymentRoutes.post("/payments", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const body: CreatePaymentBody = await c.req.json<CreatePaymentBody>().catch(() => ({} as CreatePaymentBody));
+
+  const requiredFields = ["orderId", "orderName", "amount", "method", "successUrl", "failUrl"] as const;
+  const missing = requiredFields.filter((field) => !body[field]);
+  if (missing.length > 0) {
+    throw new HTTPException(400, { message: `Missing required fields: ${missing.join(", ")}` });
+  }
+  if (typeof body.amount !== "number" || body.amount <= 0) {
+    throw new HTTPException(400, { message: "Amount must be a positive number" });
+  }
+  try {
+    new URL(String(body.successUrl));
+    new URL(String(body.failUrl));
+  } catch {
+    throw new HTTPException(400, { message: "Invalid success or fail URL format" });
+  }
+
+  const result = await withConnection(c.env, async (connection) => {
+    const duplicate = await queryRows<RowDataPacket & { id: number }>(
+      connection,
+      "SELECT id FROM payments WHERE order_id = ? LIMIT 1",
+      [String(body.orderId).trim()],
+    );
+    if (duplicate[0]) {
+      throw new HTTPException(400, { message: `Payment with order ID ${String(body.orderId).trim()} already exists` });
+    }
+
+    const paymentKey = `payment_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    const now = new Date();
+    const nextBillingDate =
+      body.isBilling && body.billingCycle && body.billingDay
+        ? calculateNextBillingDate(body.billingCycle as "MONTHLY" | "YEARLY", Number(body.billingDay), now)
+        : null;
+
+    await queryRows(
+      connection,
+      `INSERT INTO payments
+       (payment_key, order_id, order_name, user_id, customer_key, amount, currency, method, status, is_billing, billing_cycle, next_billing_date, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [
+        paymentKey,
+        String(body.orderId).trim(),
+        String(body.orderName).trim(),
+        session.user.id,
+        body.customerEmail ? String(body.customerEmail).trim() : session.user.email,
+        Number(body.amount),
+        body.currency || "KRW",
+        String(body.method),
+        body.isBilling ? 1 : 0,
+        body.billingCycle || null,
+        nextBillingDate,
+        session.user.id,
+      ],
+    );
+
+    const paymentRows = await queryRows<PaymentRow>(
+      connection,
+      `SELECT *
+       FROM payments
+       WHERE payment_key = ?
+       LIMIT 1`,
+      [paymentKey],
+    );
+
+    const payment = paymentRows[0];
+    if (!payment) {
+      throw new HTTPException(500, { message: "Failed to create payment" });
+    }
+
+    return {
+      payment: {
+        id: payment.id,
+        paymentKey: payment.payment_key,
+        orderId: payment.order_id,
+        orderName: payment.order_name,
+        amount: payment.amount,
+        currency: payment.currency,
+        method: payment.method,
+        status: payment.status,
+        isBilling: Boolean(payment.is_billing),
+        billingCycle: payment.billing_cycle,
+        nextBillingDate: payment.next_billing_date,
+        createdBy: payment.created_by,
+        createdAt: payment.created_at,
+      },
+      tossPayment: {
+        paymentKey,
+        orderId: String(body.orderId).trim(),
+        amount: body.amount,
+        checkoutUrl: `https://api.tosspayments.com/v2/payments/${paymentKey}`,
+        currency: body.currency || "KRW",
+        country: "KR",
+      },
+    };
+  });
+
+  return c.json(
+    {
+      success: true,
+      message: "Payment created successfully",
+      data: result,
+      timestamp: new Date().toISOString(),
+    },
+    201,
+  );
+});
+
 paymentRoutes.get("/payments/user/history", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const page = parsePositiveInt(c.req.query("page") || null, 1, 500);
   const limit = parsePositiveInt(c.req.query("limit") || null, 10, 100);
   const status = c.req.query("status") || null;
   const method = c.req.query("method") || null;
+  const dateFrom = parseDateTimeFilter(c.req.query("dateFrom") || null, "dateFrom");
+  const dateTo = parseDateTimeFilter(c.req.query("dateTo") || null, "dateTo");
 
   const result = await withConnection(c.env, async (connection) => {
-    const payments = await listPaymentsForUser(connection, session.user.id, page, limit, status, method);
+    const payments = await listPaymentsForUser(
+      connection,
+      session.user.id,
+      page,
+      limit,
+      status,
+      method,
+      dateFrom,
+      dateTo,
+    );
     return {
       data: payments.data.map(mapPaymentRecord),
       pagination: payments.pagination,
     };
   });
 
-  return c.json(success(result));
+  return c.json({
+    success: true,
+    data: result,
+  });
 });
 
 paymentRoutes.get("/payments/user/history-with-cancellations", async (c) => {
@@ -596,9 +819,20 @@ paymentRoutes.get("/payments/user/history-with-cancellations", async (c) => {
   const limit = parsePositiveInt(c.req.query("limit") || null, 10, 100);
   const status = c.req.query("status") || null;
   const method = c.req.query("method") || null;
+  const dateFrom = parseDateTimeFilter(c.req.query("dateFrom") || null, "dateFrom");
+  const dateTo = parseDateTimeFilter(c.req.query("dateTo") || null, "dateTo");
 
   const result = await withConnection(c.env, async (connection) => {
-    const payments = await listPaymentsForUser(connection, session.user.id, page, limit, status, method);
+    const payments = await listPaymentsForUser(
+      connection,
+      session.user.id,
+      page,
+      limit,
+      status,
+      method,
+      dateFrom,
+      dateTo,
+    );
     const paymentIds = payments.data.map((item) => item.id);
     const cancellations = await getCancellationsForPaymentIds(connection, paymentIds);
 
@@ -615,7 +849,10 @@ paymentRoutes.get("/payments/user/history-with-cancellations", async (c) => {
     };
   });
 
-  return c.json(success(result));
+  return c.json({
+    success: true,
+    data: result,
+  });
 });
 
 paymentRoutes.get("/payments/user/cancellations", async (c) => {
@@ -655,7 +892,10 @@ paymentRoutes.get("/payments/user/cancellations", async (c) => {
     };
   });
 
-  return c.json(success(result));
+  return c.json({
+    success: true,
+    data: result,
+  });
 });
 
 paymentRoutes.get("/payments/:paymentKey", async (c) => {
@@ -667,14 +907,19 @@ paymentRoutes.get("/payments/:paymentKey", async (c) => {
 
   const payment = await withConnection(c.env, async (connection) => {
     const row = await getOwnedPaymentByKey(connection, paymentKey, session.user.id);
-    return row ? mapPaymentRecord(row) : null;
+    return row ? formatPaymentForLegacyResponse(row) : null;
   });
 
   if (!payment) {
     throw new HTTPException(404, { message: "Payment not found" });
   }
 
-  return c.json(success(payment));
+  return c.json({
+    success: true,
+    message: "Payment details retrieved successfully",
+    data: payment,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 paymentRoutes.get("/payments/:paymentKey/cancellations", async (c) => {
@@ -688,7 +933,15 @@ paymentRoutes.get("/payments/:paymentKey/cancellations", async (c) => {
     getPaymentCancellationsForKey(connection, paymentKey, session.user.id),
   );
 
-  return c.json(success(result));
+  return c.json({
+    success: true,
+    data: {
+      payment: formatPaymentForLegacyResponse(result.payment),
+      cancellations: result.cancellations.map(formatCancellationForLegacyResponse),
+    },
+    message: "Payment cancellations retrieved successfully",
+    timestamp: new Date().toISOString(),
+  });
 });
 
 paymentRoutes.get("/admin/payments/failed", async (c) => {
@@ -1225,12 +1478,19 @@ paymentRoutes.delete("/payments/:paymentKey", async (c) => {
     const cancellations = await getPaymentCancellationsForKey(connection, paymentKey, session.user.id);
 
     return {
-      payment: refreshedPayment ? mapPaymentRecord(refreshedPayment) : null,
-      cancellation: cancellations.cancellations[0] || null,
+      payment: refreshedPayment ? formatPaymentForLegacyResponse(refreshedPayment) : null,
+      cancellation: cancellations.cancellations[0]
+        ? formatCancellationForLegacyResponse(cancellations.cancellations[0])
+        : null,
     };
   });
 
-  return c.json(success(result, "Payment cancelled successfully"));
+  return c.json({
+    success: true,
+    message: "Payment cancelled successfully",
+    data: result,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 paymentRoutes.post("/payments/confirm", async (c) => {
@@ -1244,14 +1504,42 @@ paymentRoutes.post("/payments/confirm", async (c) => {
     promotionCode?: string;
   }>();
 
-  if (!body.paymentKey || !body.orderId || typeof body.amount !== "number" || body.amount <= 0) {
-    throw new HTTPException(400, { message: "paymentKey, orderId, and amount are required" });
+  const validationErrors: Array<{ field: string; message: string }> = [];
+  if (!body.paymentKey) {
+    validationErrors.push({ field: "body.paymentKey", message: "paymentKey 필드는 필수입니다." });
+  }
+  if (!body.orderId) {
+    validationErrors.push({ field: "body.orderId", message: "orderId 필드는 필수입니다." });
+  }
+  if (body.amount === undefined || body.amount === null) {
+    validationErrors.push({ field: "body.amount", message: "amount 필드는 필수입니다." });
+  } else if (typeof body.amount !== "number" || body.amount <= 0) {
+    validationErrors.push({ field: "body.amount", message: "amount 필드는 1 이상의 숫자여야 합니다." });
+  }
+
+  if (validationErrors.length > 0) {
+    throw new HTTPException(422, {
+      res: new Response(
+        JSON.stringify(
+          legacyValidationFailure(
+            "요청 본문 검증에 실패했습니다.",
+            c.req.path,
+            c.req.method,
+            validationErrors,
+          ),
+        ),
+        {
+          status: 422,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        },
+      ),
+    });
   }
 
   const confirmed = await confirmPaymentWithToss(c.env, {
-    paymentKey: body.paymentKey,
-    orderId: body.orderId,
-    amount: body.amount,
+    paymentKey: body.paymentKey as string,
+    orderId: body.orderId as string,
+    amount: body.amount as number,
   });
 
   const saved = await withConnection(c.env, async (connection) => {
@@ -1362,14 +1650,19 @@ paymentRoutes.post("/payments/confirm", async (c) => {
        LIMIT 1`,
       [confirmed.paymentKey],
     );
-    return refreshedRows[0] ? mapPaymentRecord(refreshedRows[0]) : null;
+    return refreshedRows[0] ? formatPaymentForLegacyResponse(refreshedRows[0]) : null;
   });
 
   if (!saved) {
     throw new HTTPException(500, { message: "Failed to persist confirmed payment" });
   }
 
-  return c.json(success(saved, "Payment confirmed successfully"));
+  return c.json({
+    success: true,
+    message: "Payment confirmed successfully",
+    data: saved,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 paymentRoutes.post("/payments/webhook", async (c) => {
@@ -1509,4 +1802,31 @@ paymentRoutes.post("/payments/webhook", async (c) => {
   });
 
   return c.json(success(result, "Webhook processed successfully"));
+});
+
+paymentRoutes.post("/payments/test/membership", async (c) => {
+  await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const body: { userId?: string; orderName?: string } =
+    await c.req.json<{ userId?: string; orderName?: string }>().catch(
+      () => ({} as { userId?: string; orderName?: string }),
+    );
+  if (!body.userId || !body.orderName) {
+    throw new HTTPException(400, { message: "userId and orderName are required" });
+  }
+
+  const result = await withConnection(c.env, async (connection) => {
+    const processed = await applyMembershipByOrderName(connection, body.userId!, body.orderName!);
+    return {
+      userId: body.userId,
+      orderName: body.orderName,
+      processed,
+    };
+  });
+
+  return c.json({
+    success: true,
+    data: result,
+    message: "Membership processing test completed",
+    timestamp: new Date().toISOString(),
+  });
 });

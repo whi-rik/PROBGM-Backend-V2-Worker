@@ -534,7 +534,7 @@ promotionRoutes.post("/admin/promotions", async (c) => {
     }))[0] || null;
   });
 
-  return c.json(success(data, "Promotion created"), 201);
+  return c.json(success(data, "Promotion created", 201), 201);
 });
 
 promotionRoutes.put("/admin/promotions/:code/deactivate", async (c) => {

@@ -186,7 +186,7 @@ v2AdminRoutes.post("/admin/labels", async (c) => {
     return created;
   });
 
-  return c.json(success(data, "Label created"), 201);
+  return c.json(success(data, "Label created", 201), 201);
 });
 
 v2AdminRoutes.put("/admin/labels/:id", async (c) => {

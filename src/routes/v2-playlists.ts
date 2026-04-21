@@ -458,7 +458,7 @@ v2PlaylistRoutes.post("/playlist/:id/duplicate", async (c) => {
     return { id };
   });
 
-  return c.json(success(data), 201);
+  return c.json(success(data, "요청이 성공적으로 처리되었습니다.", 201), 201);
 });
 
 v2PlaylistRoutes.put("/playlist/:id/cover", async (c) => {

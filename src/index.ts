@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import type { Bindings } from "./env";
-import { failure } from "./lib/response";
+import { failure, legacyHttpFailure } from "./lib/response";
 import { healthRoutes } from "./routes/health";
 import { v3Routes } from "./routes/v3";
 import { playlistRoutes } from "./routes/playlists";
@@ -28,8 +28,20 @@ app.use("*", cors());
 
 app.onError((error, c) => {
   if (error instanceof HTTPException) {
+    const response = error.getResponse();
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      return response;
+    }
+
     return c.json(
-      failure(error.message || "Request failed", `HTTP_${error.status}`),
+      legacyHttpFailure(
+        error.message || "요청 처리 중 오류가 발생했습니다.",
+        error.status,
+        c.req.path,
+        c.req.method,
+        c.env.APP_ENV === "development" && error.stack ? { stack: error.stack } : undefined,
+      ),
       error.status,
     );
   }
@@ -37,8 +49,8 @@ app.onError((error, c) => {
   console.error("[probgm-backend-v2-worker] unhandled error", error);
   return c.json(
     failure(
-      error instanceof Error ? error.message : "Internal server error",
-      "INTERNAL_ERROR",
+      error instanceof Error ? error.message : "서버 오류가 발생했습니다.",
+      500,
     ),
     500,
   );

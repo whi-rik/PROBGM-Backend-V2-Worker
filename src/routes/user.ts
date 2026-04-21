@@ -102,7 +102,7 @@ function ensureHttpUrl(value: string, fieldName: string) {
 function normalizeSocialProvider(value: unknown) {
   const provider = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (!SUPPORTED_SOCIAL_PROVIDERS.has(provider)) {
-    throw new HTTPException(400, { message: "provider must be google, facebook, or kakao" });
+    throw new HTTPException(400, { message: "Invalid provider. Must be google, facebook, or kakao" });
   }
   return provider;
 }
@@ -412,6 +412,7 @@ userRoutes.get("/user/info", async (c) => {
       username: user.username,
       email: user.email,
       provider: user.provider,
+      is_active: Boolean(user.is_active),
       created_at: user.created_at,
       updated_at: user.updated_at,
       display_name: null,
@@ -444,6 +445,27 @@ userRoutes.get("/user/balance", async (c) => {
   return c.json(success(data));
 });
 
+userRoutes.get("/user/credits", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const data = await withConnection(c.env, async (connection) => {
+    const balance = await getBalanceRow(connection, session.user.id);
+    if (!balance) {
+      throw new HTTPException(404, { message: "User credit information not found" });
+    }
+
+    return {
+      balance: balance.balance || 0,
+      bonus_credits: balance.bonus_credits || 0,
+      bonus_credits_expires_at: balance.bonus_credits_expires_at,
+      download_point: balance.download_point || 0,
+      bonus_download_points: balance.bonus_download_points || 0,
+      bonus_download_points_expires_at: balance.bonus_download_points_expires_at,
+    };
+  });
+
+  return c.json(success(data));
+});
+
 userRoutes.get("/user/membership", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const data = await withConnection(c.env, async (connection) => {
@@ -452,19 +474,28 @@ userRoutes.get("/user/membership", async (c) => {
       throw new HTTPException(404, { message: "User membership information not found" });
     }
 
-    const startedAt = membership.started_at ? new Date(membership.started_at) : null;
-    const expiresAt =
-      startedAt && membership.renewal_interval_days
-        ? new Date(startedAt.getTime() + membership.renewal_interval_days * 24 * 60 * 60 * 1000)
-        : null;
-
     return {
-      tier: tierToName(membership.tier),
+      tier: membership.tier,
+      started_at: membership.started_at,
+      renewal_interval_days: membership.renewal_interval_days,
+      last_renewed_at: membership.last_renewed_at,
       membership_type: tierToName(membership.tier),
       status: membership.is_active ? "active" : "expired",
-      started_at: membership.started_at,
-      expires_at: expiresAt,
     };
+  });
+
+  return c.json(success(data));
+});
+
+userRoutes.get("/user/downloadPoint", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const data = await withConnection(c.env, async (connection) => {
+    const balance = await getBalanceRow(connection, session.user.id);
+    if (!balance) {
+      throw new HTTPException(404, { message: "User download points not found" });
+    }
+
+    return balance.download_point || 0;
   });
 
   return c.json(success(data));
@@ -483,12 +514,22 @@ userRoutes.get("/user/stats", async (c) => {
     return getUserStats(connection, session.user.id, user.created_at);
   });
 
-  return c.json(success(data));
+  return c.json(success(data, "사용자 통계를 성공적으로 가져왔습니다."));
 });
 
 userRoutes.get("/user/channels", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const data = await withConnection(c.env, (connection) => getUserChannels(connection, session.user.id));
+  return c.json(success(data));
+});
+
+userRoutes.get("/user/channel/:id", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const channelId = c.req.param("id");
+  const data = await withConnection(c.env, (connection) => getUserChannel(connection, session.user.id, channelId));
+  if (!data) {
+    throw new HTTPException(404, { message: "채널을 찾을 수 없습니다." });
+  }
   return c.json(success(data));
 });
 
@@ -511,7 +552,7 @@ userRoutes.post("/user/channel", async (c) => {
   const data = await withConnection(c.env, (connection) =>
     createChannel(connection, session.user.id, { name, url, platform }),
   );
-  return c.json(success(data, "Channel created"), 201);
+  return c.json(success(data, "채널이 성공적으로 생성되었습니다.", 201), 201);
 });
 
 userRoutes.put("/user/channel/:id", async (c) => {
@@ -527,7 +568,7 @@ userRoutes.put("/user/channel/:id", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const existing = await getUserChannel(connection, session.user.id, channelId);
     if (!existing) {
-      throw new HTTPException(404, { message: "Channel not found" });
+      throw new HTTPException(404, { message: "채널을 찾을 수 없습니다." });
     }
 
     const updates: string[] = [];
@@ -564,7 +605,7 @@ userRoutes.put("/user/channel/:id", async (c) => {
     return updated;
   });
 
-  return c.json(success(data, "Channel updated"));
+  return c.json(success(data, "채널이 성공적으로 수정되었습니다."));
 });
 
 userRoutes.put("/user/channel/:id/auto-renewal", async (c) => {
@@ -583,12 +624,14 @@ userRoutes.put("/user/channel/:id/auto-renewal", async (c) => {
 
     const row = existing[0];
     if (!row) {
-      throw new HTTPException(404, { message: "Channel not found" });
+      throw new HTTPException(404, { message: "채널을 찾을 수 없습니다." });
     }
 
     const nextValue = !Boolean(row.auto_renewal);
     if (Boolean(row.is_disabled) && nextValue) {
-      throw new HTTPException(400, { message: "Disabled channels cannot enable auto renewal" });
+      throw new HTTPException(400, {
+        message: "크레딧 부족으로 비활성화된 채널입니다. 자동 갱신을 활성화할 수 없습니다.",
+      });
     }
 
     await queryRows(
@@ -600,7 +643,7 @@ userRoutes.put("/user/channel/:id/auto-renewal", async (c) => {
     return { auto_renewal: nextValue };
   });
 
-  return c.json(success(data, "Auto renewal updated"));
+  return c.json(success(data, "자동 갱신 설정이 변경되었습니다."));
 });
 
 userRoutes.delete("/user/channel/:id", async (c) => {
@@ -608,6 +651,15 @@ userRoutes.delete("/user/channel/:id", async (c) => {
   const channelId = c.req.param("id");
 
   await withConnection(c.env, async (connection) => {
+    const existing = await queryRows<CountRow>(
+      connection,
+      "SELECT COUNT(*) AS count FROM users_channels WHERE user_id = ? AND channel_id = ? AND is_deleted = 0",
+      [session.user.id, channelId],
+    );
+    if ((existing[0]?.count || 0) === 0) {
+      throw new HTTPException(404, { message: "삭제할 채널을 찾을 수 없습니다." });
+    }
+
     await queryRows(
       connection,
       "UPDATE users_channels SET is_deleted = 1 WHERE user_id = ? AND channel_id = ? AND is_deleted = 0",
@@ -615,7 +667,7 @@ userRoutes.delete("/user/channel/:id", async (c) => {
     );
   });
 
-  return c.json(success(null, "Channel deleted"));
+  return c.json(success(null, "채널이 성공적으로 삭제되었습니다."));
 });
 
 userRoutes.post("/user/channel/:id/verify", async (c) => {
@@ -635,7 +687,7 @@ userRoutes.post("/user/channel/:id/verify", async (c) => {
   const data = await withConnection(c.env, async (connection) => {
     const existing = await getUserChannel(connection, session.user.id, channelId);
     if (!existing) {
-      throw new HTTPException(404, { message: "Channel not found" });
+      throw new HTTPException(404, { message: "채널을 찾을 수 없습니다." });
     }
 
     await queryRows(
@@ -654,7 +706,82 @@ userRoutes.post("/user/channel/:id/verify", async (c) => {
     return updated;
   });
 
-  return c.json(success(data, "Channel verification requested"));
+  return c.json(success(data, "채널 인증 요청이 접수되었습니다."));
+});
+
+userRoutes.put("/user/profile", async (c) => {
+  const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+  const body = ((await c.req.json().catch(() => ({}))) || {}) as {
+    username?: string;
+    email?: string;
+  };
+
+  const username = body.username === undefined ? undefined : normalizeString(body.username, 50);
+  const email = body.email === undefined ? undefined : normalizeString(body.email, 255).toLowerCase();
+
+  if (username === undefined && email === undefined) {
+    throw new HTTPException(400, { message: "수정할 프로필 정보가 필요합니다." });
+  }
+
+  const data = await withConnection(c.env, async (connection) => {
+    if (username !== undefined) {
+      if (!username) {
+        throw new HTTPException(400, { message: "유효한 username이 필요합니다." });
+      }
+      const existing = await queryRows<RowDataPacket & { id: string }>(
+        connection,
+        "SELECT id FROM users WHERE username = ? AND id != ? LIMIT 1",
+        [username, session.user.id],
+      );
+      if (existing[0]) {
+        throw new HTTPException(400, { message: "Username is already taken" });
+      }
+    }
+
+    if (email !== undefined) {
+      if (!email) {
+        throw new HTTPException(400, { message: "유효한 email이 필요합니다." });
+      }
+      const existing = await queryRows<RowDataPacket & { id: string }>(
+        connection,
+        "SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1",
+        [email, session.user.id],
+      );
+      if (existing[0]) {
+        throw new HTTPException(400, { message: "Email is already taken" });
+      }
+    }
+
+    const updates: string[] = [];
+    const values: Array<string> = [];
+    if (username !== undefined) {
+      updates.push("username = ?");
+      values.push(username);
+    }
+    if (email !== undefined) {
+      updates.push("email = ?");
+      values.push(email);
+    }
+    updates.push("updated_at = NOW()");
+
+    await queryRows(
+      connection,
+      `UPDATE users SET ${updates.join(", ")} WHERE id = ?`,
+      [...values, session.user.id],
+    );
+
+    const user = await getUserRow(connection, session.user.id);
+    return {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      provider: user.provider,
+      created_at: user.created_at,
+      updated_at: user.updated_at,
+    };
+  });
+
+  return c.json(success(data, "프로필이 성공적으로 업데이트되었습니다."));
 });
 
 userRoutes.get("/api/user/profile", async (c) => {
@@ -681,12 +808,12 @@ userRoutes.get("/api/user/profile", async (c) => {
       balance: balance
         ? {
             credits: balance.balance || 0,
-            downloadPoints: (balance.download_point || 0) + (balance.bonus_download_points || 0),
+            downloadPoints: balance.download_point || 0,
           }
         : null,
       membership: membership
         ? {
-            tier: tierToName(membership.tier),
+            tier: membership.tier,
             isActive: Boolean(membership.is_active),
             lastRenewedAt: membership.last_renewed_at,
           }
@@ -736,12 +863,12 @@ userRoutes.post("/api/user/check-social-binding", async (c) => {
     provider?: string;
     socialId?: string;
   };
-  const provider = normalizeSocialProvider(body.provider);
   const socialId = normalizeString(body.socialId, 255);
-
-  if (!socialId) {
-    throw new HTTPException(400, { message: "socialId is required" });
+  if (!body.provider || !socialId) {
+    throw new HTTPException(400, { message: "Provider and social ID are required" });
   }
+  const provider = normalizeSocialProvider(body.provider);
+
 
   const data = await withConnection(c.env, async (connection) => {
     const user = await getUserRow(connection, session.user.id);
@@ -782,12 +909,11 @@ userRoutes.post("/api/user/bind-social", async (c) => {
     socialId?: string;
     socialEmail?: string;
   };
-  const provider = normalizeSocialProvider(body.provider);
   const socialId = normalizeString(body.socialId, 255);
-
-  if (!socialId) {
-    throw new HTTPException(400, { message: "socialId is required" });
+  if (!body.provider || !socialId) {
+    throw new HTTPException(400, { message: "Provider and social ID are required" });
   }
+  const provider = normalizeSocialProvider(body.provider);
 
   const data = await withConnection(c.env, async (connection) => {
     const user = await getUserRow(connection, session.user.id);

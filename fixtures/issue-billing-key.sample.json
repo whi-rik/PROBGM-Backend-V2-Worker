@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file and replace every placeholder before using with smoke:write.",
+  "authKey": "authkey_placeholder_replace_me",
+  "customerKey": "customer_placeholder_replace_me",
+  "customerName": "Staging Test User",
+  "customerEmail": "staging@example.com"
+}

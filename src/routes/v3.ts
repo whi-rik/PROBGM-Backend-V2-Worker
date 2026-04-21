@@ -42,6 +42,14 @@ function parsePositiveInt(value: string | null, fallback: number, max: number): 
   return Math.max(1, Math.min(max, Math.floor(parsed)));
 }
 
+function parseNonNegativeInt(value: string | null, fallback: number, max: number): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(max, Math.floor(parsed)));
+}
+
 async function getAllTags(connection: DbConnection) {
   const rows = await queryRows<TagRow>(
     connection,
@@ -199,12 +207,12 @@ async function searchAssets(connection: DbConnection, queryString: URLSearchPara
       total_pages: Math.ceil((countRows[0]?.count || 0) / limit),
     },
     ...(facets ? { facets } : {}),
-    source: "mysql_worker",
+    source: "mysql_fallback",
   };
 }
 
 async function listAssets(connection: DbConnection, queryString: URLSearchParams) {
-  const page = parsePositiveInt(queryString.get("page"), 0, 10000);
+  const page = parseNonNegativeInt(queryString.get("p") || queryString.get("page"), 0, 10000);
   const limit = parsePositiveInt(queryString.get("limit"), 30, 100);
   const assetType = queryString.get("assetType");
 

@@ -4,7 +4,7 @@ import type { RowDataPacket } from "mysql2/promise";
 import type { Bindings } from "../env";
 import { requireSessionFromRequest } from "../lib/auth";
 import { queryRows, withConnection, type DbConnection } from "../lib/db";
-import { success } from "../lib/response";
+import { legacyHttpFailure, success } from "../lib/response";
 import { applyMembershipByOrderName } from "../lib/membership";
 import { recordPromotionCodeUse, validatePromotionCodeOrThrow } from "../lib/promotion";
 import { executeBillingWithToss, issueBillingKeyWithToss } from "../lib/toss";
@@ -167,8 +167,50 @@ billingRoutes.post("/billing/issue-key", async (c) => {
     customerEmail?: string;
   }>();
 
-  if (!body.authKey || !body.customerKey) {
-    throw new HTTPException(400, { message: "authKey and customerKey are required" });
+  if (!body.authKey) {
+    throw new HTTPException(422, {
+      res: new Response(
+        JSON.stringify(
+          legacyHttpFailure(
+            "authKey is required",
+            422,
+            c.req.path,
+            c.req.method,
+            {
+              code: "VALIDATION_ERROR",
+              ...(c.env.APP_ENV === "development" ? { stack: "Error: authKey is required" } : {}),
+            },
+          ),
+        ),
+        {
+          status: 422,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        },
+      ),
+    });
+  }
+
+  if (!body.customerKey) {
+    throw new HTTPException(422, {
+      res: new Response(
+        JSON.stringify(
+          legacyHttpFailure(
+            "customerKey is required",
+            422,
+            c.req.path,
+            c.req.method,
+            {
+              code: "VALIDATION_ERROR",
+              ...(c.env.APP_ENV === "development" ? { stack: "Error: customerKey is required" } : {}),
+            },
+          ),
+        ),
+        {
+          status: 422,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        },
+      ),
+    });
   }
 
   const issued = await issueBillingKeyWithToss(c.env, {
@@ -179,12 +221,15 @@ billingRoutes.post("/billing/issue-key", async (c) => {
   });
 
   return c.json(
-    success({
-      billingKey: issued.billingKey,
-      customerKey: issued.customerKey,
-      card: issued.card,
-      authenticatedAt: issued.authenticatedAt,
-    }),
+    {
+      success: true,
+      data: {
+        billingKey: issued.billingKey,
+        customerKey: issued.customerKey,
+        card: issued.card,
+        authenticatedAt: issued.authenticatedAt,
+      },
+    },
   );
 });
 
@@ -242,7 +287,10 @@ billingRoutes.get("/billing/user/cycles", async (c) => {
     };
   });
 
-  return c.json(success(result));
+  return c.json({
+    success: true,
+    data: result,
+  });
 });
 
 billingRoutes.get("/billing/:id", async (c) => {
@@ -260,7 +308,10 @@ billingRoutes.get("/billing/:id", async (c) => {
     throw new HTTPException(404, { message: "Billing cycle not found" });
   }
 
-  return c.json(success(cycle));
+  return c.json({
+    success: true,
+    data: cycle,
+  });
 });
 
 billingRoutes.put("/billing/:id/pause", async (c) => {
@@ -289,7 +340,10 @@ billingRoutes.put("/billing/:id/pause", async (c) => {
     return refreshed;
   });
 
-  return c.json(success(updated, "Billing cycle paused"));
+  return c.json({
+    success: true,
+    data: updated,
+  });
 });
 
 billingRoutes.put("/billing/:id/resume", async (c) => {
@@ -333,7 +387,10 @@ billingRoutes.put("/billing/:id/resume", async (c) => {
     return refreshed;
   });
 
-  return c.json(success(updated, "Billing cycle resumed"));
+  return c.json({
+    success: true,
+    data: updated,
+  });
 });
 
 billingRoutes.delete("/billing/:id", async (c) => {
@@ -360,7 +417,11 @@ billingRoutes.delete("/billing/:id", async (c) => {
     return refreshed;
   });
 
-  return c.json(success(updated, "Billing cycle cancelled"));
+  void updated;
+  return c.json({
+    success: true,
+    message: "Billing cycle cancelled successfully",
+  });
 });
 
 billingRoutes.post("/billing/create", async (c) => {
@@ -599,5 +660,11 @@ billingRoutes.post("/billing/create", async (c) => {
     };
   });
 
-  return c.json(success(result, "Billing cycle created"), 201);
+  return c.json(
+    {
+      success: true,
+      data: result,
+    },
+    201,
+  );
 });
