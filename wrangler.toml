@@ -1,0 +1,45 @@
+name = "probgm-backend-v2-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-21"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[vars]
+APP_ENV = "development"
+API_BASE_URL = "http://localhost:8787"
+DB_PROVIDER = "mysql"
+TYPESENSE_PROTOCOL = "https"
+TYPESENSE_TIMEOUT_MS = "5000"
+
+# For production, prefer Hyperdrive instead of raw DB credentials.
+# Example:
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "<hyperdrive-id>"
+
+# Optional D1 binding
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "probgm-backend-v2-worker"
+# database_id = "<d1-database-id>"
+
+# Optional R2 bucket binding
+# [[r2_buckets]]
+# binding = "UPLOADS_BUCKET"
+# bucket_name = "probgm-uploads"
+
+# Optional cron triggers for Worker-native background jobs
+# [[triggers.crons]]
+# crons = ["*/5 * * * *"]
+# [[triggers.crons]]
+# crons = ["15 2 * * *"]
+# [[triggers.crons]]
+# crons = ["0 0 1 * *"]
+# [[triggers.crons]]
+# crons = ["0 1 * * *"]
+# [[triggers.crons]]
+# crons = ["*/10 * * * *"]
+# [[triggers.crons]]
+# crons = ["0 * * * *"]

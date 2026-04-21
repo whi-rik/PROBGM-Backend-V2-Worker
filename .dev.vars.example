@@ -1,0 +1,46 @@
+APP_ENV=development
+API_BASE_URL=http://localhost:8787
+SESSION_EXPIRY_HOURS=24
+DB_PROVIDER=mysql
+ADMIN_USER_IDS=
+
+# Prefer Hyperdrive in deployed environments.
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=music_library
+DB_USER=root
+DB_PASS=
+
+# Alternative providers
+# DB_PROVIDER=postgres
+# POSTGRES_URL=postgresql://user:pass@127.0.0.1:5432/music_library
+#
+# DB_PROVIDER=d1
+# Configure the D1 binding in wrangler.toml as `DB`
+# Then verify with GET /health/db
+
+TYPESENSE_HOST=127.0.0.1
+TYPESENSE_PORT=8108
+TYPESENSE_API_KEY=
+TYPESENSE_COLLECTION=musics
+TYPESENSE_TAGS_COLLECTION=tags
+TYPESENSE_PROTOCOL=http
+TYPESENSE_TIMEOUT_MS=5000
+
+TOSS_PAYMENTS_SECRET_KEY=
+TOSS_PAYMENTS_BILLING_SECRET_KEY=
+TOSS_WEBHOOK_SECRET=
+
+# R2 upload
+R2_PUBLIC_URL=
+FILE_UPLOAD_PREFIX=tailored-service-upload
+FILE_UPLOAD_MAX_SIZE=104857600
+FILE_UPLOAD_ALLOWED_TYPES=audio/mpeg,audio/mp3,audio/wav,audio/ogg,audio/webm,audio/aac,audio/flac,audio/m4a,audio/x-m4a,text/plain
+UPLOAD_METADATA_TABLE=
+PAYMENT_WEBHOOK_AUDIT_TABLE=
+WORKFLOW_MONITORING_TABLE=
+TAILORED_EXTERNAL_API_URL=
+TAILORED_EXTERNAL_API_KEY=
+TAILORED_CALLBACK_SECRET=
+# Configure the R2 binding in wrangler.toml as `UPLOADS_BUCKET`
+# Then verify with GET /health/storage and GET /api/upload/health
