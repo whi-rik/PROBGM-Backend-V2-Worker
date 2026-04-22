@@ -224,6 +224,38 @@ npm run dev
 - Scheduled jobs surface failures: `src/scheduled.ts` logs structured errors
   and rethrows so the platform sees the failure.
 
+## Tests
+
+Unit tests (no DB, fast):
+
+```bash
+npm run test:unit
+```
+
+Integration tests (real MySQL required):
+
+```bash
+# One-time: apply minimal schema to an isolated test database
+TEST_DB_HOST=127.0.0.1 \
+TEST_DB_PORT=23306 \
+TEST_DB_USER=<user> \
+TEST_DB_PASS=<pass> \
+TEST_DB_NAME=<db-with-schema> \
+npm run test:db:setup
+
+# Run
+TEST_DB_HOST=127.0.0.1 \
+TEST_DB_PORT=23306 \
+TEST_DB_USER=<user> \
+TEST_DB_PASS=<pass> \
+TEST_DB_NAME=<db-with-schema> \
+npm run test:integration
+```
+
+Integration tests skip automatically when `TEST_DB_*` is unset or unreachable.
+All test data is prefixed (`IT-RDM-`, `IT-WHK-`) and cleaned up per-test; you
+can safely run against a shared dev database without affecting real rows.
+
 ## Smoke scripts
 
 Runtime/provider smoke:
