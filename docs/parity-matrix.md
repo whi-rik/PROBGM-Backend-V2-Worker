@@ -36,6 +36,12 @@ This matrix is the cutover-oriented view of what is already implemented in `PROB
 - Promotions
   - check/history/stats/usage
   - admin list/create/deactivate
+- Redeem
+  - `/api/redeem` (use code, session-auth)
+  - `/api/redeem/check/:code` (public)
+  - `/api/redeem/history` (session-auth)
+  - `/api/redeem/stats` (admin-auth)
+  - `/api/redeem/usage/:code` (admin-auth)
 - Billing and payments
   - billing key issue
   - billing cycle create/pause/resume/cancel

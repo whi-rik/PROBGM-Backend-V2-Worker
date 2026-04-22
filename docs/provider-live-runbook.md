@@ -141,3 +141,19 @@ Include:
 
 - Use `mysql` or Hyperdrive as the current safe default.
 - Treat `postgres` and `d1` as experimental until live parity checks pass.
+
+## Production safety guards
+
+As of the 2026-04-22 improvement pass, the Worker enforces:
+
+- `DB_PROVIDER=d1` is rejected at `withConnection` entry when `APP_ENV=production`.
+  Attempting a production deploy with `DB_PROVIDER=d1` fails fast with a clear
+  error. Remove the guard in `src/lib/db.ts` only after D1 SQL normalization is
+  rewritten to cover dialect gaps documented in
+  [backend-v2-worker-review.md](./backend-v2-worker-review.md).
+- The Toss webhook handler refuses requests with HTTP 503 when
+  `TOSS_WEBHOOK_SECRET` is missing and `APP_ENV != development`. Confirm the
+  secret is set in the target environment before routing webhook traffic.
+
+These guards are deliberately verbose in logs so that misconfiguration does not
+appear as a silent data issue later.

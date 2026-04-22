@@ -206,6 +206,16 @@ async function createD1Connection(env: Bindings): Promise<DbConnection> {
 
 export async function withConnection<T>(env: Bindings, fn: (connection: DbConnection) => Promise<T>): Promise<T> {
   const provider = getProvider(env);
+
+  if (provider === "d1") {
+    const appEnv = (env.APP_ENV || "development").toLowerCase();
+    if (appEnv === "production") {
+      throw new Error(
+        "DB_PROVIDER=d1 is not permitted when APP_ENV=production. d1 SQL normalization is intentionally loose; use mysql/Hyperdrive for production parity.",
+      );
+    }
+  }
+
   const connection =
     provider === "d1"
       ? await createD1Connection(env)

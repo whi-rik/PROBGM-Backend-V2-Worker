@@ -8,6 +8,12 @@ import { legacyHttpFailure, success } from "../lib/response";
 import { applyMembershipByOrderName } from "../lib/membership";
 import { recordPromotionCodeUse, validatePromotionCodeOrThrow } from "../lib/promotion";
 import { executeBillingWithToss, issueBillingKeyWithToss } from "../lib/toss";
+import {
+  WORKER_CRON_SCHEDULES,
+  expireMembershipCredits,
+  processDueBillingCycles,
+  processRetryBillingCycles,
+} from "../lib/jobs";
 
 interface BillingCycleRow extends RowDataPacket {
   id: number;
@@ -667,4 +673,49 @@ billingRoutes.post("/billing/create", async (c) => {
     },
     201,
   );
+});
+
+billingRoutes.post("/billing/process/pending", async (c) => {
+  await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+
+  const data = await withConnection(c.env, async (connection) => {
+    const due = await processDueBillingCycles(c.env, connection);
+    const retries = await processRetryBillingCycles(c.env, connection);
+    return { due, retries };
+  });
+
+  return c.json({
+    success: true,
+    data,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+billingRoutes.post("/billing/process/expired-memberships", async (c) => {
+  await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+
+  const data = await withConnection(c.env, async (connection) => {
+    return expireMembershipCredits(connection);
+  });
+
+  return c.json({
+    success: true,
+    data,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+billingRoutes.get("/billing/cron/status", async (c) => {
+  await requireSessionFromRequest(c.env, c.req.header("Authorization"));
+
+  return c.json({
+    success: true,
+    data: {
+      runtime: "cloudflare-workers-scheduled",
+      isRunning: true,
+      note: "Scheduled via Cloudflare Workers cron triggers. See wrangler.toml for active triggers.",
+      schedules: WORKER_CRON_SCHEDULES,
+    },
+    timestamp: new Date().toISOString(),
+  });
 });

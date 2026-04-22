@@ -82,6 +82,17 @@ Do not cut over if any of these fail:
 - download entitlement parity
 - auth/session stability
 - provider ping and schema health
+- redeem route family parity (all 5 endpoints)
+- Toss webhook signature verification in staging/production (must fail-closed when `TOSS_WEBHOOK_SECRET` is missing)
+
+## 7. Required environment posture
+
+- `APP_ENV=production` in production deploys so that:
+  - missing `TOSS_WEBHOOK_SECRET` rejects webhook requests with 503
+  - `DB_PROVIDER=d1` is refused at `withConnection` entry
+- `TOSS_WEBHOOK_SECRET` configured with the production Toss secret.
+- `PAYMENT_WEBHOOK_AUDIT_TABLE` set to the deployed audit table so webhook idempotency (pre-check on `webhook_id`) is active. Apply `migrations/worker-optional/002_worker_payment_webhook_audit.mysql.sql` — the UNIQUE KEY on `webhook_id` is required.
+- Frontend authentication is bearer-only; no cookie-based SSID fallback exists or is needed (verified against `PROBGM-Frontend` and `PROBGM-Frontend-V2`).
 
 Fallback path:
 

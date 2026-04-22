@@ -135,10 +135,73 @@ Use this when:
 - a single user/payment must be traced to a promotion application
 - discount totals over a time window need validation
 
-## 5. Sequence for incident triage
+## 5. Redeem operations
+
+Check redeem stats and a specific code:
+
+```bash
+curl -H "Authorization: Bearer <admin-ssid>" \
+  "https://your-worker.example.com/api/redeem/stats"
+
+curl -H "Authorization: Bearer <admin-ssid>" \
+  "https://your-worker.example.com/api/redeem/usage/WELCOME2026"
+```
+
+Use this when:
+
+- a redeem code appears to be granting more than its intended uses
+- a user reports missing rewards after redeem
+- a label or membership grant needs to be audited against the usage log
+
+## 6. Billing manual triggers
+
+Scheduled billing runs via Cloudflare Workers cron. If an incident requires a
+manual run between cron ticks, use these session-authenticated endpoints:
+
+```bash
+# Run due + retry billing cycles immediately
+curl -X POST -H "Authorization: Bearer <ssid>" \
+  "https://your-worker.example.com/api/billing/process/pending"
+
+# Expire credits that passed their renewal window
+curl -X POST -H "Authorization: Bearer <ssid>" \
+  "https://your-worker.example.com/api/billing/process/expired-memberships"
+
+# Confirm the scheduler runtime and current cron mappings
+curl -H "Authorization: Bearer <ssid>" \
+  "https://your-worker.example.com/api/billing/cron/status"
+```
+
+Use this when:
+
+- Cloudflare cron triggers are paused or misconfigured and a batch must run now
+- a specific user's billing retry cannot wait for the next cron tick
+- verifying the Worker's advertised schedule vs the actual `wrangler.toml` triggers
+
+## 7. Webhook replay / idempotency
+
+Inbound Toss webhooks are deduplicated by `webhook_id` against the configured
+`PAYMENT_WEBHOOK_AUDIT_TABLE`. When a webhook is re-delivered:
+
+- the Worker returns the cached `PROCESSED` result with `idempotent: true`
+- no state mutation re-runs (payments, billing cycles, memberships)
+- audit rows are only written on first processing
+
+Checks during incident triage:
+
+1. Inspect `worker_payment_webhook_audit` rows for repeated `webhook_id`.
+2. If a stale `FAILED` status persists, it means idempotency did not apply —
+   confirm the UNIQUE KEY on `webhook_id` is present (see
+   `migrations/worker-optional/002_worker_payment_webhook_audit.mysql.sql`).
+3. If `TOSS_WEBHOOK_SECRET` is unset in staging/production, the Worker refuses
+   webhooks with 503. Check environment posture before assuming delivery failure.
+
+## 8. Sequence for incident triage
 
 1. Check failed payments for the incident window.
 2. Check cancellations for the same window.
-3. If webhook processing is involved, inspect webhook audit rows and stats.
+3. If webhook processing is involved, inspect webhook audit rows and stats (section 3 + 7).
 4. If a discount or billing amount looks wrong, inspect promotion stats and code usage.
-5. Record the findings in the deployment or incident log before retrying or rolling back.
+5. If a reward / membership was lost, inspect redeem usage (section 5).
+6. If billing did not execute on schedule, confirm cron status and run manual triggers (section 6).
+7. Record the findings in the deployment or incident log before retrying or rolling back.

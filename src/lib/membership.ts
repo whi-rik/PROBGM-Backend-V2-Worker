@@ -165,3 +165,151 @@ export async function applyMembershipByOrderName(
   await resetUserBalanceForTier(connection, userId, plan.tier);
   return true;
 }
+
+export type RedeemMembershipType = "basic" | "premium" | "pro" | "dev" | "edu";
+
+export function redeemMembershipTypeToTier(membershipType: RedeemMembershipType): MembershipTier {
+  switch (membershipType) {
+    case "basic":
+      return MembershipTier.BASIC;
+    case "pro":
+      return MembershipTier.PRO;
+    case "premium":
+      return MembershipTier.MASTER;
+    case "edu":
+      return MembershipTier.EDU;
+    case "dev":
+      return MembershipTier.DEV;
+    default:
+      throw new Error(`Invalid membership type: ${membershipType}`);
+  }
+}
+
+export async function grantRedeemMembership(
+  connection: DbConnection,
+  userId: string,
+  membershipType: RedeemMembershipType,
+  durationDays: number,
+) {
+  const tier = redeemMembershipTypeToTier(membershipType);
+  const safeDurationDays = Math.max(1, Math.floor(durationDays));
+
+  await queryRows(
+    connection,
+    `INSERT INTO users_membership (user, tier, started_at, renewal_interval_days, last_renewed_at, is_active)
+     VALUES (?, ?, NOW(), ?, NOW(), 1)
+     ON DUPLICATE KEY UPDATE
+       tier = GREATEST(tier, VALUES(tier)),
+       renewal_interval_days = GREATEST(renewal_interval_days, VALUES(renewal_interval_days)),
+       last_renewed_at = VALUES(last_renewed_at),
+       is_active = VALUES(is_active)`,
+    [userId, tier, safeDurationDays],
+  );
+}
+
+async function resolveLaterExpiry(
+  connection: DbConnection,
+  userId: string,
+  column: "bonus_credits_expires_at" | "bonus_download_points_expires_at",
+  candidateExpiresAt: Date,
+): Promise<Date> {
+  try {
+    const rows = await queryRows<RowDataPacket & { existing: Date | string | null }>(
+      connection,
+      `SELECT ${column} AS existing FROM users_balance WHERE user = ? LIMIT 1`,
+      [userId],
+    );
+    const existing = rows[0]?.existing;
+    if (existing) {
+      const existingDate = existing instanceof Date ? existing : new Date(existing);
+      if (!Number.isNaN(existingDate.getTime()) && existingDate > candidateExpiresAt) {
+        return existingDate;
+      }
+    }
+  } catch {
+    // Column may not exist yet on legacy deployments. Fall back to the candidate expiry.
+  }
+  return candidateExpiresAt;
+}
+
+export async function addBonusCredits(
+  connection: DbConnection,
+  userId: string,
+  amount: number,
+  expiresInDays: number,
+  description: string,
+) {
+  if (amount <= 0) {
+    return;
+  }
+
+  await ensureUserBalanceRow(connection, userId);
+
+  const candidateExpiresAt = new Date();
+  candidateExpiresAt.setDate(candidateExpiresAt.getDate() + Math.max(1, Math.floor(expiresInDays)));
+  const finalExpiresAt = await resolveLaterExpiry(
+    connection,
+    userId,
+    "bonus_credits_expires_at",
+    candidateExpiresAt,
+  );
+
+  await queryRows(
+    connection,
+    `UPDATE users_balance
+     SET bonus_credits = COALESCE(bonus_credits, 0) + ?,
+         bonus_credits_expires_at = ?
+     WHERE user = ?`,
+    [amount, finalExpiresAt, userId],
+  );
+
+  try {
+    const balanceRows = await queryRows<RowDataPacket & { balance: number; bonus_credits: number | null }>(
+      connection,
+      "SELECT balance, bonus_credits FROM users_balance WHERE user = ? LIMIT 1",
+      [userId],
+    );
+    const totalBalance = Number(balanceRows[0]?.balance || 0) + Number(balanceRows[0]?.bonus_credits || 0);
+
+    await queryRows(
+      connection,
+      `INSERT INTO users_transaction
+       (id, operated_by, user, subject, change_amount, balance, datetime)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [crypto.randomUUID(), "system", userId, description, amount, totalBalance],
+    );
+  } catch {
+    // Transaction log is best-effort. Legacy deployments without users_transaction column parity must not fail the grant.
+  }
+}
+
+export async function addBonusDownloadPoints(
+  connection: DbConnection,
+  userId: string,
+  amount: number,
+  expiresInDays: number,
+) {
+  if (amount <= 0) {
+    return;
+  }
+
+  await ensureUserBalanceRow(connection, userId);
+
+  const candidateExpiresAt = new Date();
+  candidateExpiresAt.setDate(candidateExpiresAt.getDate() + Math.max(1, Math.floor(expiresInDays)));
+  const finalExpiresAt = await resolveLaterExpiry(
+    connection,
+    userId,
+    "bonus_download_points_expires_at",
+    candidateExpiresAt,
+  );
+
+  await queryRows(
+    connection,
+    `UPDATE users_balance
+     SET bonus_download_points = COALESCE(bonus_download_points, 0) + ?,
+         bonus_download_points_expires_at = ?
+     WHERE user = ?`,
+    [amount, finalExpiresAt, userId],
+  );
+}

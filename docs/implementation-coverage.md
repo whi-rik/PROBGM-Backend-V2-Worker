@@ -164,6 +164,23 @@ Status:
 - beyond minimum parity for current scope
 - Worker includes extra operational filtering and admin usage inspection
 
+### Redeem
+
+Legacy reference:
+
+- `routes/redeemRoutes.ts`: `5`
+
+Worker:
+
+- `src/routes/redeem.ts`: `5`
+
+Status:
+
+- full 1:1 parity restored in the 2026-04-22 improvement pass
+- reward granting uses `grantRedeemMembership`, `addBonusCredits`, `addBonusDownloadPoints` in `src/lib/membership.ts`
+- schema unchanged: Worker reads/writes `redeem_codes` and `redeem_code_usage` exactly like legacy
+- rate limiting on `/redeem/check/:code` is not implemented in-app (legacy uses Express rate-limit). Attach via Cloudflare WAF / rate-limit rules at the edge
+
 ### Billing and payments
 
 Legacy reference:

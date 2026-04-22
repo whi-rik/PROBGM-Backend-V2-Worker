@@ -498,6 +498,52 @@ async function persistWebhookAudit(
   );
 }
 
+async function findProcessedWebhookResult(
+  connection: DbConnection,
+  env: Bindings,
+  webhookId: string,
+): Promise<{ result: unknown } | null> {
+  const table = getWebhookAuditTableName(env);
+  if (!table || !webhookId) {
+    return null;
+  }
+
+  try {
+    const rows = await queryRows<RowDataPacket & { processing_result: string | null }>(
+      connection,
+      `SELECT processing_result
+       FROM ${table}
+       WHERE webhook_id = ? AND status = 'PROCESSED'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [webhookId],
+    );
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    let parsed: unknown = null;
+    if (row.processing_result) {
+      try {
+        parsed = JSON.parse(row.processing_result);
+      } catch {
+        parsed = row.processing_result;
+      }
+    }
+    return { result: parsed };
+  } catch {
+    return null;
+  }
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const buffer = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 async function listPaymentsForUser(
   connection: DbConnection,
   userId: string,
@@ -1680,16 +1726,28 @@ paymentRoutes.post("/payments/webhook", async (c) => {
   }
 
   const webhookSecret = c.env.TOSS_WEBHOOK_SECRET?.trim();
+  const appEnv = (c.env.APP_ENV || "development").toLowerCase();
   if (webhookSecret) {
     const signature = extractWebhookSignature(c.req.raw.headers);
     if (!(await verifyWebhookSignature(rawBody, signature, webhookSecret))) {
       throw new HTTPException(401, { message: "Webhook signature verification failed" });
     }
+  } else if (appEnv !== "development") {
+    console.error(
+      "[payments.webhook] TOSS_WEBHOOK_SECRET is not configured. Refusing webhook in non-development environment.",
+    );
+    throw new HTTPException(503, {
+      message: "Webhook signature verification is required but not configured",
+    });
   }
 
   if (webhook.createdAt && !validateWebhookTimestamp(webhook.createdAt, 300)) {
     throw new HTTPException(400, { message: "Webhook timestamp is too old" });
   }
+
+  const stableWebhookId = webhook.id && typeof webhook.id === "string" && webhook.id.trim()
+    ? webhook.id.trim()
+    : `body_sha256:${await sha256Hex(rawBody)}`;
 
   const result = await withConnection(c.env, async (connection) => {
     const eventType = webhook.eventType as string;
@@ -1698,7 +1756,13 @@ paymentRoutes.post("/payments/webhook", async (c) => {
     const orderId = typeof paymentData.orderId === "string" ? paymentData.orderId.trim() : null;
     const billingKey = typeof paymentData.billingKey === "string" ? paymentData.billingKey.trim() : null;
     const customerKey = typeof paymentData.customerKey === "string" ? paymentData.customerKey.trim() : null;
-    const webhookId = webhook.id || `webhook_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const webhookId = stableWebhookId;
+
+    const existing = await findProcessedWebhookResult(connection, c.env, webhookId);
+    if (existing) {
+      const cached = existing.result && typeof existing.result === "object" ? existing.result : { result: existing.result };
+      return { ...cached, idempotent: true, webhookId };
+    }
 
     try {
       let result: unknown;

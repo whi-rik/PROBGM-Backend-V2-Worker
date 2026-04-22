@@ -137,6 +137,21 @@ Notable fixes:
 - `/api/playlist/:id/musics` now returns the legacy empty payload/message for `null` or `undefined` playlist ids
 - `restore` and `publicItems` permission failures were moved toward legacy `400 ValidationError` behavior
 
+### Redeem
+
+- `/api/redeem`
+- `/api/redeem/check/:code`
+- `/api/redeem/history`
+- `/api/redeem/stats`
+- `/api/redeem/usage/:code`
+
+Notable:
+
+- reward granting stays transactional with code usage (membership + bonus credits + bonus download points)
+- membership type → tier mapping is identical to legacy (`basic→1`, `pro→2`, `premium→3`, `edu→4`, `dev→5`)
+- `current_uses` is incremented inside `FOR UPDATE` transaction
+- admin-only endpoints enforce `requireAdminSessionFromRequest` like legacy `verifyAdmin`
+
 ### Payments / Billing
 
 - `/api/payments`

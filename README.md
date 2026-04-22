@@ -69,6 +69,11 @@ Current migration slice:
 - `GET /api/admin/promotions`
 - `POST /api/admin/promotions`
 - `PUT /api/admin/promotions/:code/deactivate`
+- `POST /api/redeem`
+- `GET /api/redeem/check/:code`
+- `GET /api/redeem/history`
+- `GET /api/redeem/stats`
+- `GET /api/redeem/usage/:code`
 - `GET /api/sync/typesense/status`
 - `GET /api/sync/typesense/consistency`
 - `POST /api/sync/typesense/incremental`
@@ -130,6 +135,9 @@ Current migration slice:
 - `GET /api/admin/payments/cancellations/stats`
 - `GET /api/admin/payments/webhook-audit`
 - `GET /api/admin/payments/webhook-audit/stats`
+- `POST /api/billing/process/pending`
+- `POST /api/billing/process/expired-memberships`
+- `GET /api/billing/cron/status`
 
 Admin payment inspection filters:
 - `createdFrom`
@@ -199,7 +207,22 @@ npm run dev
   - `GET /health/storage`
   - `GET /api/upload/health`
 - The worker expects `Authorization: Bearer <ssid>` for authenticated routes.
+  Cookie-based session fallback is intentionally not supported — both
+  `PROBGM-Frontend` and `PROBGM-Frontend-V2` send the session as a Bearer
+  header, so adding a cookie fallback would only widen the attack surface.
 - `SESSION_EXPIRY_HOURS` defaults to `24` if not set.
+
+## Production safety guards
+
+- Toss webhook handler requires `TOSS_WEBHOOK_SECRET` in any non-`development`
+  `APP_ENV`. Missing secret → HTTP 503.
+- `DB_PROVIDER=d1` is rejected when `APP_ENV=production`. Use MySQL / Hyperdrive
+  for production until D1 dialect normalization is hardened.
+- Webhook delivery is idempotent when `PAYMENT_WEBHOOK_AUDIT_TABLE` is set.
+  Apply `migrations/worker-optional/002_worker_payment_webhook_audit.mysql.sql`
+  and keep the UNIQUE KEY on `webhook_id` intact.
+- Scheduled jobs surface failures: `src/scheduled.ts` logs structured errors
+  and rethrows so the platform sees the failure.
 
 ## Smoke scripts
 
