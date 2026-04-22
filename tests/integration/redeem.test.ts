@@ -136,6 +136,49 @@ describe("POST /api/redeem — integration", () => {
     expect(String(body.message)).toMatch(/already used/i);
   });
 
+  it.skipIf(shouldSkip)("rejects expired code with 400", async () => {
+    const user = await createTestUser(conn, { prefix: PREFIX });
+    const expired = new Date(Date.now() - 24 * 3600 * 1000); // yesterday
+    const code = await createTestRedeemCode(conn, {
+      prefix: PREFIX,
+      reward_type: "membership",
+      membership_type: "basic",
+      duration_days: 30,
+      max_uses: -1,
+      expires_at: expired,
+    });
+
+    const response = await postRedeem(env!, user.ssid, code.code);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as Record<string, any>;
+    expect(String(body.message)).toMatch(/expired/i);
+  });
+
+  it.skipIf(shouldSkip)("rejects inactive code with 400", async () => {
+    const user = await createTestUser(conn, { prefix: PREFIX });
+    const code = await createTestRedeemCode(conn, {
+      prefix: PREFIX,
+      reward_type: "membership",
+      membership_type: "basic",
+      duration_days: 30,
+      max_uses: -1,
+      is_active: false,
+    });
+
+    const response = await postRedeem(env!, user.ssid, code.code);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as Record<string, any>;
+    expect(String(body.message)).toMatch(/no longer active|inactive/i);
+  });
+
+  it.skipIf(shouldSkip)("rejects unknown code with 400", async () => {
+    const user = await createTestUser(conn, { prefix: PREFIX });
+    const response = await postRedeem(env!, user.ssid, `${PREFIX}DOES-NOT-EXIST`);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as Record<string, any>;
+    expect(String(body.message)).toMatch(/invalid/i);
+  });
+
   it.skipIf(shouldSkip)("allows exactly one winner under concurrent use for max_uses=1", async () => {
     const userA = await createTestUser(conn, { prefix: PREFIX });
     const userB = await createTestUser(conn, { prefix: PREFIX });

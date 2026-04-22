@@ -59,6 +59,11 @@ app.onError((error, c) => {
 
 app.route("/", healthRoutes);
 app.route("/", userRoutes);
+// Legacy Backend-TS mounts user routes under /api (so the contract is
+// /api/user/info, /api/user/channel/:id, /api/user/profile, etc.). FE V2 has
+// been authored against the unprefixed /user/* form, and some FE V1 call
+// sites still use the /api/user/* form. Register both so no client breaks.
+app.route("/api", userRoutes);
 app.route("/api/auth", authRoutes);
 app.route("/api/v3", v3Routes);
 app.route("/api", playlistRoutes);

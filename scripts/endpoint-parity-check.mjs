@@ -40,6 +40,9 @@ const METHODS = ["get", "post", "put", "patch", "delete"];
 
 // Worker route files and how they are mounted in src/index.ts. Kept explicit
 // because app.route("/api", xRoutes) pattern-matching is fragile across edits.
+// An array value means the file is mounted under more than one prefix — e.g.
+// user.ts is registered at both "" (FE V2 paths) and "/api" (FE V1 + legacy
+// contract).
 const WORKER_MOUNTS = {
   "health.ts": "",
   "auth.ts": "/api/auth",
@@ -48,7 +51,7 @@ const WORKER_MOUNTS = {
   "v2-playlists.ts": "/api/v2",
   "billing.ts": "/api",
   "payments.ts": "/api",
-  "user.ts": "",
+  "user.ts": ["", "/api"],
   "download.ts": "/api",
   "promotion.ts": "/api",
   "redeem.ts": "/api",
@@ -140,16 +143,36 @@ const ALLOWED_DRIFT = [
   "GET /api/v3/:type",
   "GET /api/v3/search",
   "GET /api/v3/stats",
-  // Known drift worth surfacing separately (see below).
-  //
-  // Worker exposes /user/* (no /api prefix) while legacy exposes /api/user/*.
-  // FE V2 was authored against Worker paths and works; FE V1 has at least one
-  // /api/user/label call site that will break on Worker cutover. This drift
-  // is intentionally left OUT of the allowlist so `endpoint-parity-check`
-  // keeps flagging it. Resolve by either:
-  //   a) add an /api/user/* alias route family on the Worker that proxies to
-  //      the same handlers, or
-  //   b) update FE V1 to use /user/* paths before cutover.
+  // Worker exposes user/channel routes at BOTH /user/* (FE V2) and /api/user/*
+  // (FE V1 + legacy contract). The double-mount is in src/index.ts — see the
+  // comment there. The unprefixed form is Worker-only and allowlisted here;
+  // the /api-prefixed form matches legacy and is NOT in the allowlist.
+  "GET /user/balance",
+  "GET /user/channel/:id",
+  "GET /user/channels",
+  "GET /user/credits",
+  "GET /user/downloadPoint",
+  "GET /user/info",
+  "GET /user/label",
+  "GET /user/membership",
+  "GET /user/stats",
+  "POST /user/channel",
+  "POST /user/channel/:id/verify",
+  "PUT /user/channel/:id",
+  "PUT /user/channel/:id/auto-renewal",
+  "PUT /user/profile",
+  "DELETE /user/channel/:id",
+  "GET /user/profile",
+  "PUT /user/username",
+  "POST /user/check-social-binding",
+  "POST /user/bind-social",
+  "DELETE /user/unbind-social",
+  "DELETE /user/account",
+  // GET /user/label reads the authenticated user's current label. Legacy
+  // labelRoutes.ts is a separate file (not in LEGACY_MOUNTS) and exposes
+  // label writes under /api/user/label POST. Different methods, different
+  // semantics, intentionally not considered drift.
+  "GET /api/user/label",
 ];
 
 function normalisePath(path) {
@@ -223,8 +246,12 @@ async function collectWorkerRoutes() {
     const text = await readText(file);
     const identifiers = detectRouterIdentifiers(text);
     if (identifiers.length === 0) continue;
-    for (const r of extractRoutes(text, identifiers, WORKER_MOUNTS[filename])) {
-      routes.add(r);
+    const mountValue = WORKER_MOUNTS[filename];
+    const prefixes = Array.isArray(mountValue) ? mountValue : [mountValue];
+    for (const prefix of prefixes) {
+      for (const r of extractRoutes(text, identifiers, prefix)) {
+        routes.add(r);
+      }
     }
   }
 

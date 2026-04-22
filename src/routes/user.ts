@@ -784,7 +784,7 @@ userRoutes.put("/user/profile", async (c) => {
   return c.json(success(data, "프로필이 성공적으로 업데이트되었습니다."));
 });
 
-userRoutes.get("/api/user/profile", async (c) => {
+userRoutes.get("/user/profile", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const data = await withConnection(c.env, async (connection) => {
     const user = await getUserRow(connection, session.user.id);
@@ -824,7 +824,7 @@ userRoutes.get("/api/user/profile", async (c) => {
   return c.json(success(data, "User profile retrieved successfully"));
 });
 
-userRoutes.put("/api/user/username", async (c) => {
+userRoutes.put("/user/username", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const body = ((await c.req.json().catch(() => ({}))) || {}) as {
     username?: string;
@@ -857,7 +857,7 @@ userRoutes.put("/api/user/username", async (c) => {
   return c.json(success(data, "Username updated successfully"));
 });
 
-userRoutes.post("/api/user/check-social-binding", async (c) => {
+userRoutes.post("/user/check-social-binding", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const body = ((await c.req.json().catch(() => ({}))) || {}) as {
     provider?: string;
@@ -902,7 +902,7 @@ userRoutes.post("/api/user/check-social-binding", async (c) => {
   return c.json(success(data, data.canBind ? "Social account can be bound" : "Cannot bind social account"));
 });
 
-userRoutes.post("/api/user/bind-social", async (c) => {
+userRoutes.post("/user/bind-social", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const body = ((await c.req.json().catch(() => ({}))) || {}) as {
     provider?: string;
@@ -947,7 +947,7 @@ userRoutes.post("/api/user/bind-social", async (c) => {
   return c.json(success(data, `${provider} account successfully linked`));
 });
 
-userRoutes.delete("/api/user/unbind-social", async (c) => {
+userRoutes.delete("/user/unbind-social", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
 
   const data = await withConnection(c.env, async (connection) => {
@@ -970,7 +970,7 @@ userRoutes.delete("/api/user/unbind-social", async (c) => {
   return c.json(success(data, "Social account successfully unlinked"));
 });
 
-userRoutes.delete("/api/user/account", async (c) => {
+userRoutes.delete("/user/account", async (c) => {
   const session = await requireSessionFromRequest(c.env, c.req.header("Authorization"));
   const body = ((await c.req.json().catch(() => ({}))) || {}) as {
     password?: string;

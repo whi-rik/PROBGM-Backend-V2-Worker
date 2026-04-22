@@ -80,23 +80,24 @@ PROBGM-Backend-V2-Worker/
 
 아래 항목들은 코드 직접 확인을 거친 결과. 하위 에이전트 보고 중 실제 코드와 맞지 않는 주장(예: `title` → `name` 컬럼 이름 드리프트, `playlists` 복수형 테이블 사용, grants admin 누락)은 모두 검증 과정에서 기각하고, 본 문서에는 **재검증된 것만** 싣는다.
 
-### 4.0 [HIGH] `/user/*` vs `/api/user/*` 경로 접두사 드리프트 (2026-04-22 추가)
+### 4.0 [CLOSED 2026-04-22] `/user/*` vs `/api/user/*` 경로 접두사 드리프트
 
-`scripts/endpoint-parity-check.mjs` 를 도입하면서 새로 드러난 드리프트.
+`scripts/endpoint-parity-check.mjs` 도입 당시 드러난 드리프트. 같은 날 해소됨.
 
-- 레거시 Backend-TS: `userProvider.ts` / `userManagement.ts` 를 `/api` 아래에 mount → 최종 경로 `/api/user/info`, `/api/user/balance`, `/api/user/channel/:id`, `PUT /api/user/profile` 등 **14 개**.
-- Worker: `src/routes/user.ts` 를 `""` 에 mount + 파일 내 핸들러가 `/user/info` 등 → 최종 경로 `/user/info`, `/user/balance`, ... 로 **`/api` 접두사 없음**.
-- FE V2 (`PROBGM-Frontend-V2`): `/user/*` (Worker 와 일치) 로 호출 중. 문제 없음.
-- FE V1 (`PROBGM-Frontend`): 일부 호출 지점에서 `/api/user/label` 를 쓰고 있음 (`lib/gtag.ts` 등에서 직접 확인됨). Worker 로 넘어가면 해당 호출은 **404 / 라우트 없음** 으로 실패.
+**과거 문제**:
+- 레거시 Backend-TS 는 user 라우트를 `/api` 아래에 mount → `/api/user/info`, `/api/user/balance`, ...
+- Worker 는 `src/routes/user.ts` 를 `""` 에 mount + 파일 내 핸들러 15 개가 `/user/*`, 6 개가 `/api/user/*` 로 **혼재 선언**되어 있었음. FE V2 는 `/user/*` + `/api/user/*` 양쪽 모두 호출, FE V1 는 `/api/user/*` 계약을 기대.
 
-**원칙 위반**: "엔드포인트 경로 불변" 규칙에 부분적으로 어긋남. 접두사를 드롭한 것은 Worker 저작 시점의 선택이었으나 CLAUDE.md §2.1 에 기록된 레거시 계약과 다르다.
+**해결 (2026-04-22)**:
+1. `src/routes/user.ts` 의 6 개 `/api/user/*` 핸들러 선언을 모두 `/user/*` 로 정규화 (파일 내 단일 컨벤션 확립).
+2. `src/index.ts` 에서 `userRoutes` 를 `""` 와 `/api` **양쪽에 dual mount**. 한 핸들러가 `/user/info` 와 `/api/user/info` 양쪽으로 노출됨.
+3. `scripts/endpoint-parity-check.mjs` 의 WORKER_MOUNTS 에 user.ts 의 dual mount 반영 (배열 값 지원 추가).
 
-**조치 후보**:
-- 권장 A: Worker 에서 `/user/*` 와 `/api/user/*` 두 경로를 같은 핸들러로 노출 (얇은 alias). 추가 코드 ~20 줄. FE V1 무수정.
-- 옵션 B: FE V1 를 `/user/*` 로 수정하고 legacy 를 은퇴시킬 때 동기화.
-- 컷오버 이전 결정 필요.
-
-**자동 감지**: `npm run parity:endpoints` 가 exit code 1 로 리포트. 조치 후 allowlist 에서 해제.
+**결과**:
+- FE V1 의 `/api/user/*` 호출 → 정상 매치
+- FE V2 의 `/user/*` + `/api/user/*` 호출 → 정상 매치
+- `npm run parity:endpoints` → exit 0 clean
+- CLAUDE.md §2.1 레거시 계약과 다시 일치
 
 ---
 
