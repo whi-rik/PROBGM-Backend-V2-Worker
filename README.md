@@ -309,3 +309,6 @@ npm run smoke:admin
 - [docs/admin-incident-runbook.md](./docs/admin-incident-runbook.md)
 - [docs/parity-matrix.md](./docs/parity-matrix.md)
 - [docs/cutover-readiness.md](./docs/cutover-readiness.md)
+- [docs/backend-v2-worker-review.md](./docs/backend-v2-worker-review.md)
+- [docs/backend-v2-worker-improvement-plan.md](./docs/backend-v2-worker-improvement-plan.md)
+- [docs/test-strategy.md](./docs/test-strategy.md)
