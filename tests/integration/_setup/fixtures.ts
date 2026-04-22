@@ -90,3 +90,81 @@ export async function createTestRedeemCode(
   const id = (result as { insertId: number }).insertId;
   return { id, code };
 }
+
+export interface CreateTestBillingCycleOptions {
+  prefix: string;
+  userId: string;
+  status?: "ACTIVE" | "PAUSED" | "CANCELLED" | "EXPIRED";
+  cycleType?: "MONTHLY" | "YEARLY";
+  billingDay?: number;
+  amount?: number;
+  customerKey?: string;
+  billingKey?: string;
+  nextBillingDate?: Date;
+  maxRetries?: number;
+}
+
+export interface TestBillingCycle {
+  id: number;
+  userId: string;
+  status: "ACTIVE" | "PAUSED" | "CANCELLED" | "EXPIRED";
+}
+
+/**
+ * The real `billing_cycles` schema requires `payment_id` (NOT NULL). We create
+ * a throwaway payment row first so the billing cycle satisfies that constraint.
+ * The payment row is cleaned up via `cleanupByPrefix` (DELETE FROM payments
+ * WHERE user_id LIKE prefix%).
+ */
+export async function createTestBillingCycle(
+  conn: Connection,
+  options: CreateTestBillingCycleOptions,
+): Promise<TestBillingCycle> {
+  const status = options.status || "ACTIVE";
+  const amount = options.amount ?? 9900;
+  const customerKey =
+    options.customerKey || `${options.prefix}ck-${crypto.randomUUID().slice(0, 8)}`;
+  const billingKey =
+    options.billingKey || `${options.prefix}bk-${crypto.randomUUID().slice(0, 8)}`;
+  const nextBillingDate =
+    options.nextBillingDate || new Date(Date.now() + 30 * 24 * 3600 * 1000);
+
+  const [paymentResult] = await conn.query(
+    `INSERT INTO payments
+     (payment_key, order_id, order_name, amount, currency, method, status, user_id, customer_key, billing_key, is_billing, created_by)
+     VALUES (?, ?, ?, ?, 'KRW', 'BILLING', 'DONE', ?, ?, ?, 1, ?)`,
+    [
+      `${options.prefix}pk-${crypto.randomUUID().slice(0, 12)}`,
+      `${options.prefix}oid-${crypto.randomUUID().slice(0, 12)}`,
+      `${options.prefix}BASIC Monthly`,
+      amount,
+      options.userId,
+      customerKey,
+      billingKey,
+      options.userId,
+    ],
+  );
+  const paymentId = (paymentResult as { insertId: number }).insertId;
+
+  const [result] = await conn.query(
+    `INSERT INTO billing_cycles
+     (payment_id, user_id, customer_key, billing_key, cycle_type, billing_day, amount,
+      status, next_billing_date, retry_count, max_retries)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    [
+      paymentId,
+      options.userId,
+      customerKey,
+      billingKey,
+      options.cycleType || "MONTHLY",
+      options.billingDay ?? 1,
+      amount,
+      status,
+      nextBillingDate,
+      options.maxRetries ?? 3,
+    ],
+  );
+
+  const id = (result as { insertId: number }).insertId;
+  return { id, userId: options.userId, status };
+}

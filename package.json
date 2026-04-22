@@ -12,6 +12,8 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:integration:watch": "vitest --config vitest.integration.config.ts",
     "test:db:setup": "bash ./scripts/test-db-setup.sh",
+    "parity:schema": "node ./scripts/schema-parity-check.mjs",
+    "parity:endpoints": "node ./scripts/endpoint-parity-check.mjs",
     "compare:contract": "node ./scripts/compare-contract.mjs",
     "compare:write": "bash ./scripts/compare-write.sh",
     "smoke:provider": "bash ./scripts/provider-smoke.sh",

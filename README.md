@@ -256,6 +256,23 @@ Integration tests skip automatically when `TEST_DB_*` is unset or unreachable.
 All test data is prefixed (`IT-RDM-`, `IT-WHK-`) and cleaned up per-test; you
 can safely run against a shared dev database without affecting real rows.
 
+## Parity checks
+
+Compare the Worker against the legacy `PROBGM-Backend-TS` source and flag drift:
+
+```bash
+# Every table the Worker reads/writes must appear in legacy source.
+npm run parity:schema
+
+# Every Worker endpoint in cutover scope must have a legacy counterpart
+# (path + method). Intentional differences are in ALLOWED_DRIFT inside the
+# script. Unintentional ones are reported at exit code 1.
+npm run parity:endpoints
+```
+
+Both scripts accept `LEGACY_ROOT=/abs/path` when the sibling `PROBGM-Backend-TS`
+directory is not at `../PROBGM-Backend-TS`.
+
 ## Smoke scripts
 
 Runtime/provider smoke:
