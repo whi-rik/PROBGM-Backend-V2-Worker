@@ -1,0 +1,2391 @@
+openapi: 3.0.3
+info:
+  title: PROBGM Backend V2 Worker
+  version: 0.1.0
+  description: |
+    Cloudflare Workers-based backend for PROBGM. Contract-equivalent migration
+    of `PROBGM-Backend-TS`. Endpoint paths, DB schema, and response envelope
+    stay identical to the legacy Express backend; Workers-native concerns
+    (runtime scheduling, R2 uploads, Hyperdrive DB) are isolated internally.
+
+    Authentication: `Authorization: Bearer <ssid>` header. `ssid` is the
+    session UUID stored in the `users_tokens` table. Cookie-based sessions
+    are NOT supported.
+
+    User routes are dual-mounted at both `/user/*` (FE V2 style) and
+    `/api/user/*` (FE V1 + legacy contract). Each handler is reachable
+    under both prefixes.
+
+    Webhook idempotency: `POST /api/payments/webhook` deduplicates by
+    `webhook_id` (falls back to SHA-256 of the raw body when `id` is
+    missing). Duplicate deliveries return `idempotent: true`.
+
+  license:
+    name: Proprietary
+  contact:
+    name: PROBGM Team
+
+servers:
+  - url: http://localhost:8787
+    description: Local wrangler dev
+  - url: https://worker-staging.example.com
+    description: Staging (replace with your Worker URL)
+  - url: https://worker.example.com
+    description: Production (replace with your Worker URL)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Health
+    description: Runtime diagnostics and provider health.
+  - name: Auth
+    description: Local/social session lifecycle.
+  - name: OTP
+    description: Email OTP flows for register/login.
+  - name: User
+    description: Authenticated user info, balance, membership, channels, profile.
+  - name: Discovery
+    description: v3 asset/tag discovery.
+  - name: Playlists
+    description: Playlist CRUD and v2 features (reorder/like/popular/duplicate).
+  - name: Downloads
+    description: Download listing and point-gated download handoff.
+  - name: Promotion
+    description: Promotion code check/history/stats (amount discount at checkout).
+  - name: Redeem
+    description: Redeem code use/check/history/stats (grants membership/credits/download points).
+  - name: Upload
+    description: R2-backed file upload.
+  - name: Billing
+    description: Recurring billing cycles (pause/resume/cancel + manual triggers).
+  - name: Payments
+    description: Toss payment confirm/cancel/history and webhook.
+  - name: Admin
+    description: Admin dashboard, channel verification, payment inspection.
+  - name: V2 Admin
+    description: Label CRUD, pending-grant retry.
+  - name: Sync
+    description: Typesense sync/consistency operations.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: ssid (UUID stored in users_tokens.token)
+
+  schemas:
+    # -- Envelope ----------------------------------------------------------
+    ApiResponse:
+      type: object
+      required: [success, data, message, statusCode]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          description: Route-specific payload. See individual responses.
+        message:
+          type: string
+          example: 요청이 성공적으로 처리되었습니다.
+        statusCode:
+          type: integer
+          example: 200
+
+    Failure:
+      type: object
+      required: [success, message, statusCode]
+      properties:
+        success:
+          type: boolean
+          example: false
+        data:
+          description: Always null on failure.
+          type: object
+          nullable: true
+        message:
+          type: string
+        statusCode:
+          type: integer
+        code:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    # -- Domain entities ---------------------------------------------------
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        email: { type: string, format: email, nullable: true }
+        provider:
+          type: string
+          enum: [local, google, facebook, kakao, otp]
+        is_newbie: { type: boolean }
+        created_at: { type: string, format: date-time, nullable: true }
+
+    AuthSession:
+      type: object
+      properties:
+        ssid: { type: string, format: uuid }
+        user: { $ref: "#/components/schemas/User" }
+
+    Balance:
+      type: object
+      properties:
+        balance: { type: integer }
+        bonus_credits: { type: integer }
+        bonus_credits_expires_at: { type: string, format: date-time, nullable: true }
+        download_point: { type: integer }
+        bonus_download_points: { type: integer }
+        bonus_download_points_expires_at: { type: string, format: date-time, nullable: true }
+
+    MembershipTier:
+      type: integer
+      enum: [0, 1, 2, 3, 4, 5]
+      description: "0=FREE, 1=BASIC, 2=PRO, 3=MASTER, 4=EDU, 5=DEV"
+
+    Membership:
+      type: object
+      properties:
+        tier: { $ref: "#/components/schemas/MembershipTier" }
+        tier_name:
+          type: string
+          enum: [FREE, BASIC, PRO, MASTER, EDU, DEV]
+        started_at: { type: string, format: date-time }
+        renewal_interval_days: { type: integer }
+        last_renewed_at: { type: string, format: date-time }
+        is_active: { type: boolean }
+
+    Channel:
+      type: object
+      properties:
+        id: { type: string }
+        channel_id: { type: string }
+        name: { type: string, nullable: true }
+        url: { type: string, nullable: true }
+        is_verified: { type: boolean }
+        auto_renewal: { type: boolean }
+        is_expired: { type: boolean }
+        verification_keyword: { type: string }
+        reg_in: { type: string, format: date-time }
+
+    PromotionCode:
+      type: object
+      properties:
+        code: { type: string }
+        discount_type: { type: string, enum: [FIXED_AMOUNT, PERCENTAGE] }
+        discount_value: { type: number }
+        applicable_plans:
+          type: array
+          items: { type: string }
+          nullable: true
+        description: { type: string, nullable: true }
+        is_active: { type: integer }
+        current_uses: { type: integer }
+        max_uses: { type: integer, description: "-1 = unlimited" }
+        expires_at: { type: string, format: date-time, nullable: true }
+
+    RedeemRewardType:
+      type: string
+      enum: [membership, credits, download_points, combo]
+
+    RedeemMembershipType:
+      type: string
+      enum: [basic, premium, pro, dev, edu]
+
+    RedeemUsageInfo:
+      type: object
+      properties:
+        current: { type: integer }
+        max: { type: integer, description: "-1 = unlimited" }
+        remaining:
+          oneOf:
+            - type: integer
+            - type: string
+              enum: [unlimited]
+
+    RedeemCodeCheckData:
+      type: object
+      properties:
+        rewardType: { $ref: "#/components/schemas/RedeemRewardType" }
+        usage: { $ref: "#/components/schemas/RedeemUsageInfo" }
+        expiresAt: { type: string, format: date-time, nullable: true }
+        membership:
+          type: object
+          nullable: true
+          properties:
+            type: { $ref: "#/components/schemas/RedeemMembershipType" }
+            durationDays: { type: integer }
+        credits:
+          type: object
+          nullable: true
+          properties:
+            amount: { type: integer }
+        downloadPoints:
+          type: object
+          nullable: true
+          properties:
+            amount: { type: integer }
+
+    RedeemGrantResult:
+      type: object
+      properties:
+        rewardType: { $ref: "#/components/schemas/RedeemRewardType" }
+        membership:
+          type: object
+          nullable: true
+          properties:
+            type: { $ref: "#/components/schemas/RedeemMembershipType" }
+            durationDays: { type: integer }
+            endDate: { type: string, format: date-time }
+        credits:
+          type: object
+          nullable: true
+          properties:
+            amount: { type: integer }
+            expiresInDays: { type: integer }
+        downloadPoints:
+          type: object
+          nullable: true
+          properties:
+            amount: { type: integer }
+            expiresInDays: { type: integer }
+        codeUsage: { $ref: "#/components/schemas/RedeemUsageInfo" }
+
+    PaymentRecord:
+      type: object
+      properties:
+        id: { type: integer }
+        paymentKey: { type: string }
+        orderId: { type: string }
+        orderName: { type: string }
+        amount: { type: number }
+        currency: { type: string }
+        method: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [READY, IN_PROGRESS, WAITING_FOR_DEPOSIT, DONE, CANCELED, PARTIAL_CANCELED, ABORTED, EXPIRED]
+        userId: { type: string, format: uuid }
+        customerKey: { type: string, nullable: true }
+        billingKey: { type: string, nullable: true }
+        isBilling: { type: boolean }
+        billingCycle:
+          type: string
+          enum: [MONTHLY, YEARLY]
+          nullable: true
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PaymentCancellation:
+      type: object
+      properties:
+        id: { type: integer }
+        paymentId: { type: integer }
+        paymentKey: { type: string }
+        transactionKey: { type: string, nullable: true }
+        cancelAmount: { type: number }
+        cancelReason: { type: string, nullable: true }
+        cancellationType: { type: string, enum: [FULL, PARTIAL] }
+        status:
+          type: string
+          enum: [PENDING, APPROVED, REJECTED, COMPLETED, FAILED]
+        requestedBy: { type: string, format: uuid, nullable: true }
+        approvedBy: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    BillingCycle:
+      type: object
+      properties:
+        id: { type: integer }
+        payment_id: { type: integer }
+        user_id: { type: string, format: uuid }
+        customer_key: { type: string }
+        billing_key: { type: string }
+        cycle_type: { type: string, enum: [MONTHLY, YEARLY] }
+        billing_day: { type: integer }
+        amount: { type: number }
+        status:
+          type: string
+          enum: [ACTIVE, PAUSED, CANCELLED, EXPIRED]
+        next_billing_date: { type: string, format: date-time, nullable: true }
+        last_billing_date: { type: string, format: date-time, nullable: true }
+        retry_count: { type: integer }
+        max_retries: { type: integer }
+
+    Playlist:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        is_public: { type: boolean }
+        is_hide: { type: boolean }
+        is_default: { type: boolean }
+        created_in: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    # -- Webhook -----------------------------------------------------------
+    TossWebhookRequest:
+      type: object
+      required: [eventType, data]
+      properties:
+        id: { type: string, description: "Event id. When omitted, the Worker derives a stable id from sha256(rawBody)." }
+        eventType:
+          type: string
+          enum: [PAYMENT_STATUS_CHANGED, PAYMENT_WEBHOOK, BILLING_DELETED]
+        createdAt: { type: string, format: date-time }
+        data:
+          type: object
+          properties:
+            paymentKey: { type: string }
+            orderId: { type: string }
+            billingKey: { type: string }
+            customerKey: { type: string }
+            status: { type: string }
+
+    TossWebhookResult:
+      type: object
+      properties:
+        action: { type: string }
+        eventType: { type: string }
+        paymentKey: { type: string, nullable: true }
+        idempotent:
+          type: boolean
+          description: true when this delivery matched a previously processed webhook_id.
+        webhookId: { type: string }
+
+  responses:
+    Success:
+      description: Success
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+    Created:
+      description: Created
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+    BadRequest:
+      description: Validation or business-rule failure
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+    Unauthorized:
+      description: Missing or invalid session
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+    Forbidden:
+      description: Session is valid but lacks required role (usually admin)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+    NotFound:
+      description: Target resource does not exist
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+    Conflict:
+      description: Idempotent replay or duplicate
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+    ServiceUnavailable:
+      description: Runtime guard blocked the request (e.g. missing webhook secret in staging/production)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Failure" }
+
+paths:
+  # ========================== Health ==========================
+  /:
+    get:
+      tags: [Health]
+      summary: Worker root
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Runtime and binding summary
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /health/db:
+    get:
+      tags: [Health]
+      summary: DB provider ping
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /health/storage:
+    get:
+      tags: [Health]
+      summary: R2 binding readiness
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /health/schema:
+    get:
+      tags: [Health]
+      summary: Optional-table readiness report (upload_metadata, webhook_audit)
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /health/jobs:
+    get:
+      tags: [Health]
+      summary: Scheduled-job runtime summary
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== Auth ==========================
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Local or social account registration
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                provider:
+                  type: string
+                  enum: [local, google, facebook, kakao]
+                social_id: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/auth/verify:
+    post:
+      tags: [Auth]
+      summary: Identify + mint a session (social verify / local verify)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                identifier:
+                  type: string
+                  description: "Email for local, social id for social providers."
+                credential: { type: string }
+                provider:
+                  type: string
+                  enum: [local, google, facebook, kakao]
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AuthSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: Social user not found (SOCIAL_USER_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Local email/password login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/social/callback:
+    post:
+      tags: [Auth]
+      summary: Social callback with optional auto-register (Worker-specific)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [google, facebook, kakao]
+                social_id: { type: string }
+                email: { type: string, format: email }
+                username: { type: string }
+                autoRegister: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current authenticated user
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/isLogged:
+    get:
+      tags: [Auth]
+      summary: Whether the caller is logged in (no-throw; returns success:true/false)
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/auth/check:
+    get:
+      tags: [Auth]
+      summary: Session validation
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Invalidate current session
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/auth/signout:
+    post:
+      tags: [Auth]
+      summary: Alias of /logout (legacy-compatible spelling)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh the current session
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/newbie/check:
+    get:
+      tags: [Auth]
+      summary: Returns whether the user still needs onboarding
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/newbie/confirm:
+    post:
+      tags: [Auth]
+      summary: Mark onboarding complete
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---- OTP ----
+  /api/auth/otp/check-email:
+    post:
+      tags: [OTP]
+      summary: Check email availability before OTP register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/auth/otp/register/request:
+    post:
+      tags: [OTP]
+      summary: Request OTP for registration
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                username: { type: string }
+      responses:
+        "200":
+          description: In development, the response `data` includes `otpCode` (emailer is not wired on the Worker yet).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+
+  /api/auth/otp/register/verify:
+    post:
+      tags: [OTP]
+      summary: Verify OTP and complete registration
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string }
+                code: { type: string }
+                username: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/auth/otp/login/request:
+    post:
+      tags: [OTP]
+      summary: Request OTP for login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/auth/otp/login/verify:
+    post:
+      tags: [OTP]
+      summary: Verify OTP and issue session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string }
+                code: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/auth/otp/resend:
+    post:
+      tags: [OTP]
+      summary: Resend the most recent OTP (cooldown enforced)
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "429":
+          description: Resend cooldown still active
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+
+  /api/auth/otp/verify:
+    post:
+      tags: [OTP]
+      summary: Verify OTP without context (standalone check)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string }
+                code: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== User ==========================
+  # Handlers are registered once in src/routes/user.ts and dual-mounted at
+  # both "" (FE V2) and /api (FE V1 + legacy contract). The spec documents
+  # one canonical path; the alternate form is identical.
+
+  /user/info:
+    get:
+      tags: [User]
+      summary: Current user profile summary
+      description: Also reachable at `GET /api/user/info`.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/balance:
+    get:
+      tags: [User]
+      summary: Current balance (membership + bonus)
+      description: Also at `GET /api/user/balance`.
+      responses:
+        "200":
+          description: ApiResponse envelope with data shaped like `Balance`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Balance" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/credits:
+    get:
+      tags: [User]
+      summary: Credits subset of balance. Also at /api/user/credits.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/downloadPoint:
+    get:
+      tags: [User]
+      summary: Download points subset of balance. Also at /api/user/downloadPoint.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/membership:
+    get:
+      tags: [User]
+      summary: Active membership. Also at /api/user/membership.
+      responses:
+        "200":
+          description: ApiResponse envelope with data shaped like `Membership`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Membership" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/label:
+    get:
+      tags: [User]
+      summary: Current user label (read-only; writes are on legacy labelRoutes).
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/stats:
+    get:
+      tags: [User]
+      summary: Aggregated user stats. Also at /api/user/stats.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/profile:
+    get:
+      tags: [User]
+      summary: Extended profile read. Also at /api/user/profile.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/username:
+    put:
+      tags: [User]
+      summary: Update username. Also at /api/user/username.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string, minLength: 1, maxLength: 50 }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/check-social-binding:
+    post:
+      tags: [User]
+      summary: Check whether a social id is already bound.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, socialId]
+              properties:
+                provider:
+                  type: string
+                  enum: [google, facebook, kakao]
+                socialId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /user/bind-social:
+    post:
+      tags: [User]
+      summary: Bind a social id to the current user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, socialId]
+              properties:
+                provider:
+                  type: string
+                  enum: [google, facebook, kakao]
+                socialId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /user/unbind-social:
+    delete:
+      tags: [User]
+      summary: Remove a social binding. Also at /api/user/unbind-social.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /user/account:
+    delete:
+      tags: [User]
+      summary: Delete the current user account. Also at /api/user/account.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ---- Channels ----
+  /user/channels:
+    get:
+      tags: [User]
+      summary: List user channels. Also at /api/user/channels.
+      responses:
+        "200":
+          description: ApiResponse envelope with data as Channel[].
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Channel" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /user/channel:
+    post:
+      tags: [User]
+      summary: Register a new channel. Also at /api/user/channel.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                name: { type: string }
+                url: { type: string, format: uri }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /user/channel/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [User]
+      summary: Channel detail
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [User]
+      summary: Update channel metadata
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                url: { type: string, format: uri }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [User]
+      summary: Delete channel
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /user/channel/{id}/auto-renewal:
+    put:
+      tags: [User]
+      summary: Toggle auto-renewal on a channel
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /user/channel/{id}/verify:
+    post:
+      tags: [User]
+      summary: Request channel verification
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verificationUrl]
+              properties:
+                verificationUrl: { type: string, format: uri }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== Discovery ==========================
+  /api/v3/tags:
+    get:
+      tags: [Discovery]
+      summary: Full tag list grouped by type
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/tags/stats:
+    get:
+      tags: [Discovery]
+      summary: Tag usage counts
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/tags/search:
+    get:
+      tags: [Discovery]
+      summary: Tag fuzzy search (Typesense with SQL fallback)
+      security: []
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/tags/{type}:
+    get:
+      tags: [Discovery]
+      summary: Tags by type
+      security: []
+      parameters:
+        - in: path
+          name: type
+          required: true
+          schema:
+            type: string
+            enum: [genre, mood, instrument, scene]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/assets/list:
+    get:
+      tags: [Discovery]
+      summary: Asset listing with pagination
+      security: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 100 }
+        - in: query
+          name: seed
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/assets/search:
+    get:
+      tags: [Discovery]
+      summary: Asset search (Typesense-backed with SQL fallback)
+      security: []
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 100 }
+        - in: query
+          name: tags
+          schema: { type: string, description: Comma-separated tag ids }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v3/assets/{id}:
+    get:
+      tags: [Discovery]
+      summary: Asset detail
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ========================== Playlists ==========================
+  /api/playlists:
+    get:
+      tags: [Playlists]
+      summary: User playlist list
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlists/public:
+    get:
+      tags: [Playlists]
+      summary: Public playlists
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlists/mine:
+    get:
+      tags: [Playlists]
+      summary: My playlists (Worker convenience alias)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlists/accessible:
+    get:
+      tags: [Playlists]
+      summary: Playlists the user can access (owned + granted)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/favoriteId:
+    get:
+      tags: [Playlists]
+      summary: Caller's favorite playlist id
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist:
+    post:
+      tags: [Playlists]
+      summary: Create playlist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                description: { type: string }
+                is_public: { type: boolean }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/playlist/add:
+    post:
+      tags: [Playlists]
+      summary: Add a track
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [playlistId, musicId]
+              properties:
+                playlistId: { type: string }
+                musicId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/remove:
+    post:
+      tags: [Playlists]
+      summary: Remove a track
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [playlistId, musicId]
+              properties:
+                playlistId: { type: string }
+                musicId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/{id}/favorite:
+    post:
+      tags: [Playlists]
+      summary: Toggle favorite on a playlist
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Playlists]
+      summary: Playlist detail
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [Playlists]
+      summary: Update playlist fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                description: { type: string }
+                is_public: { type: boolean }
+                is_hide: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Playlists]
+      summary: Soft-delete playlist
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/{id}/musics:
+    get:
+      tags: [Playlists]
+      summary: Playlist track listing
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/{id}/music/{musicId}/custom-title:
+    put:
+      tags: [Playlists]
+      summary: Override the displayed title for a track
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: musicId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                custom_title: { type: string, nullable: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/playlist/{id}/permissions:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Playlists]
+      summary: List permission grants
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Playlists]
+      summary: Grant permission to another user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, permission_type]
+              properties:
+                userId: { type: string }
+                permission_type: { type: string }
+                expires_at: { type: string, format: date-time, nullable: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Playlists]
+      summary: Revoke permission
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ---- v2 playlist features ----
+  /api/v2/playlist/{id}/cover:
+    put:
+      tags: [Playlists]
+      summary: Set cover image metadata
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cover_image_url: { type: string, format: uri, nullable: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlist/{id}/reorder:
+    put:
+      tags: [Playlists]
+      summary: Bulk track reorder
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [musicIds]
+              properties:
+                musicIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlist/{id}/music/{musicId}/order:
+    patch:
+      tags: [Playlists]
+      summary: Move a single track
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: musicId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sort_order]
+              properties:
+                sort_order: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlist/{id}/like:
+    post:
+      tags: [Playlists]
+      summary: Toggle like
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlists/liked:
+    get:
+      tags: [Playlists]
+      summary: Liked playlists
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlists/popular:
+    get:
+      tags: [Playlists]
+      summary: Popular playlists
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlists/category/{category}:
+    get:
+      tags: [Playlists]
+      summary: Playlists by category
+      security: []
+      parameters:
+        - in: path
+          name: category
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/playlist/{id}/duplicate:
+    post:
+      tags: [Playlists]
+      summary: Duplicate a playlist into the caller's library
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+
+  # ========================== Downloads ==========================
+  /api/download/list:
+    get:
+      tags: [Downloads]
+      summary: List granted downloads for the caller
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/download/{id}:
+    get:
+      tags: [Downloads]
+      summary: Prepare a download permission (deducts download point atomically)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ========================== Promotion ==========================
+  /api/promotion/check/{code}:
+    get:
+      tags: [Promotion]
+      summary: Validate a promotion code (public)
+      security: []
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+        - in: query
+          name: amount
+          schema: { type: number }
+        - in: query
+          name: plan
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/promotion/history:
+    get:
+      tags: [Promotion]
+      summary: My promotion-code usage history
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/promotion/stats:
+    get:
+      tags: [Promotion]
+      summary: Promotion stats (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/promotion/usage/{code}:
+    get:
+      tags: [Promotion]
+      summary: Usage log for a promotion code (admin)
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/promotions:
+    get:
+      tags: [Promotion]
+      summary: Admin promotion list
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Promotion]
+      summary: Create a promotion code (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, discount_type, discount_value]
+              properties:
+                code: { type: string }
+                discount_type:
+                  type: string
+                  enum: [FIXED_AMOUNT, PERCENTAGE]
+                discount_value: { type: number }
+                applicable_plans:
+                  type: array
+                  items: { type: string }
+                max_uses: { type: integer }
+                expires_at: { type: string, format: date-time, nullable: true }
+                description: { type: string }
+      responses:
+        "201":
+          description: Promotion created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/PromotionCode" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/promotions/{code}/deactivate:
+    put:
+      tags: [Promotion]
+      summary: Deactivate a promotion code (admin)
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ========================== Redeem ==========================
+  /api/redeem:
+    post:
+      tags: [Redeem]
+      summary: Use a redeem code
+      description: |
+        Atomically locks the code row (FOR UPDATE), validates it, writes a
+        usage row, increments current_uses, and grants the declared rewards:
+          - membership (UPSERT into users_membership with GREATEST semantics)
+          - credits (add to users_balance.bonus_credits with expiry)
+          - download_points (add to users_balance.bonus_download_points with expiry)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: Normalized to uppercase internally.
+      responses:
+        "200":
+          description: Code consumed; rewards applied
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/RedeemGrantResult" }
+        "400":
+          description: Code invalid / expired / already used by this user / usage limit reached
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500":
+          description: Code was consumed but reward grant failed (manual fix required — check logs)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+
+  /api/redeem/check/{code}:
+    get:
+      tags: [Redeem]
+      summary: Validate a redeem code without consuming it (public)
+      security: []
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: |
+            `valid` is always boolean. `data` is populated when valid=true.
+            Rate limiting is intentionally NOT applied inside the Worker;
+            attach via Cloudflare WAF / Rate Limiting Rules at the edge.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  valid: { type: boolean }
+                  message: { type: string }
+                  data: { $ref: "#/components/schemas/RedeemCodeCheckData" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/redeem/history:
+    get:
+      tags: [Redeem]
+      summary: My redeem-code usage history
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/redeem/stats:
+    get:
+      tags: [Redeem]
+      summary: Redeem code statistics (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/redeem/usage/{code}:
+    get:
+      tags: [Redeem]
+      summary: Usage log for a redeem code (admin)
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ========================== Upload ==========================
+  /api/upload:
+    post:
+      tags: [Upload]
+      summary: Upload a file to R2
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400":
+          description: File missing, MIME not allowed, or file too large
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: UPLOADS_BUCKET binding not configured
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+
+  /api/upload/health:
+    get:
+      tags: [Upload]
+      summary: Upload subsystem readiness
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== Billing ==========================
+  /api/billing/user/cycles:
+    get:
+      tags: [Billing]
+      summary: List my billing cycles
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [ACTIVE, PAUSED, CANCELLED, EXPIRED]
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/billing/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Billing]
+      summary: Billing cycle detail
+      responses:
+        "200":
+          description: Single billing cycle
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/BillingCycle" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Billing]
+      summary: Cancel (soft-cancel) billing cycle
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400":
+          description: Already cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/billing/{id}/pause:
+    put:
+      tags: [Billing]
+      summary: Pause an ACTIVE cycle
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400":
+          description: Cycle is not ACTIVE
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/billing/{id}/resume:
+    put:
+      tags: [Billing]
+      summary: Resume a PAUSED cycle
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nextBillingDate:
+                  type: string
+                  format: date-time
+                  description: Optional override. If omitted, next_billing_date is recomputed from cycle_type + billing_day.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400":
+          description: Cycle is not PAUSED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/billing/issue-key:
+    post:
+      tags: [Billing]
+      summary: Issue a Toss billing key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerKey, authKey]
+              properties:
+                customerKey: { type: string }
+                authKey: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/billing/create:
+    post:
+      tags: [Billing]
+      summary: Create a new billing cycle (execute first recurring charge)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerKey, billingKey, cycleType, billingDay, amount, orderName]
+              properties:
+                customerKey: { type: string }
+                billingKey: { type: string }
+                cycleType:
+                  type: string
+                  enum: [MONTHLY, YEARLY]
+                billingDay: { type: integer, minimum: 1, maximum: 28 }
+                amount: { type: number }
+                orderName: { type: string }
+                promotionCode: { type: string, nullable: true }
+      responses:
+        "201":
+          description: Billing cycle created and first payment executed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          billingCycle: { $ref: "#/components/schemas/BillingCycle" }
+                          firstPayment: { $ref: "#/components/schemas/PaymentRecord" }
+                          membershipProcessed: { type: boolean }
+                          promotion:
+                            type: object
+                            nullable: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/billing/process/pending:
+    post:
+      tags: [Billing]
+      summary: Manually run due + retry billing jobs (operator use)
+      responses:
+        "200":
+          description: Execution summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/billing/process/expired-memberships:
+    post:
+      tags: [Billing]
+      summary: Manually expire memberships past their grace window
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/billing/cron/status:
+    get:
+      tags: [Billing]
+      summary: Scheduler runtime metadata and cron schedules
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== Payments ==========================
+  /api/payments/user/history:
+    get:
+      tags: [Payments]
+      summary: My payment history
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 100 }
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: method
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/payments/user/history-with-cancellations:
+    get:
+      tags: [Payments]
+      summary: Payment history joined with cancellation rows
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/payments/user/cancellations:
+    get:
+      tags: [Payments]
+      summary: My cancellation history
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/payments/{paymentKey}:
+    parameters:
+      - in: path
+        name: paymentKey
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Payments]
+      summary: Payment detail by paymentKey
+      responses:
+        "200":
+          description: Payment detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/PaymentRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Payments]
+      summary: Cancel payment (full or partial)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cancelReason]
+              properties:
+                cancelReason: { type: string }
+                cancelAmount: { type: number, description: Omit for full cancel }
+                refundReceiveAccount:
+                  type: object
+                  properties:
+                    bank: { type: string }
+                    accountNumber: { type: string }
+                    holderName: { type: string }
+      responses:
+        "200":
+          description: Cancellation recorded
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/PaymentCancellation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/payments/{paymentKey}/cancellations:
+    get:
+      tags: [Payments]
+      summary: Cancellation list for a payment
+      parameters:
+        - in: path
+          name: paymentKey
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/payments/confirm:
+    post:
+      tags: [Payments]
+      summary: Confirm a one-time Toss payment (no auth — callable from FE after redirect)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentKey, orderId, amount]
+              properties:
+                paymentKey: { type: string }
+                orderId: { type: string }
+                amount: { type: number }
+      responses:
+        "200":
+          description: Confirmed; DB updated and membership applied if order_name matches a plan
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/PaymentRecord" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/payments/webhook:
+    post:
+      tags: [Payments]
+      summary: Toss webhook endpoint (idempotent)
+      description: |
+        The handler refuses requests with HTTP 503 when `APP_ENV != development`
+        and `TOSS_WEBHOOK_SECRET` is not configured. When configured, the
+        signature is verified via HMAC-SHA256.
+
+        Idempotency: dedupes by `webhook_id` against
+        `PAYMENT_WEBHOOK_AUDIT_TABLE`. If no `id` is present on the payload,
+        the Worker derives a stable id from `sha256(rawBody)`. Replays return
+        `idempotent: true` without re-running state mutations.
+      security: []
+      parameters:
+        - in: header
+          name: x-toss-signature
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TossWebhookRequest" }
+      responses:
+        "200":
+          description: Webhook processed (possibly idempotent replay)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/TossWebhookResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Signature present but does not verify
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+        "503":
+          description: Webhook secret is required in this environment but was not configured
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Failure" }
+
+  /api/admin/payments/failed:
+    get:
+      tags: [Admin]
+      summary: List failed payments (admin)
+      parameters:
+        - in: query
+          name: createdFrom
+          schema: { type: string, format: date-time }
+        - in: query
+          name: createdTo
+          schema: { type: string, format: date-time }
+        - in: query
+          name: userId
+          schema: { type: string }
+        - in: query
+          name: orderId
+          schema: { type: string }
+        - in: query
+          name: method
+          schema: { type: string }
+        - in: query
+          name: billingOnly
+          schema: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/payments/cancellations:
+    get:
+      tags: [Admin]
+      summary: List cancellations (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/payments/cancellations/stats:
+    get:
+      tags: [Admin]
+      summary: Cancellation stats (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/payments/webhook-audit:
+    get:
+      tags: [Admin]
+      summary: Webhook audit log (admin)
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: eventType
+          schema: { type: string }
+        - in: query
+          name: paymentKey
+          schema: { type: string }
+        - in: query
+          name: orderId
+          schema: { type: string }
+        - in: query
+          name: billingKey
+          schema: { type: string }
+        - in: query
+          name: customerKey
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/payments/webhook-audit/stats:
+    get:
+      tags: [Admin]
+      summary: Webhook audit stats (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ========================== Admin (misc) ==========================
+  /api/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Admin dashboard summary
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/channels/stats:
+    get:
+      tags: [Admin]
+      summary: Channel stats
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/channels:
+    get:
+      tags: [Admin]
+      summary: Channel listing
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/channel-verifications/pending:
+    get:
+      tags: [Admin]
+      summary: Pending verification queue
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/channel-verifications/{id}:
+    get:
+      tags: [Admin]
+      summary: Single verification lookup
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/admin/channel-verifications/{id}/approve:
+    post:
+      tags: [Admin]
+      summary: Approve verification
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/channel-verifications/{id}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject verification
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/admin/channels/{id}/disable:
+    post:
+      tags: [Admin]
+      summary: Force-disable a channel
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== V2 Admin ==========================
+  /api/v2/admin/labels/stats:
+    get:
+      tags: [V2 Admin]
+      summary: Label stats
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/labels:
+    get:
+      tags: [V2 Admin]
+      summary: Label listing
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [V2 Admin]
+      summary: Create label
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string, nullable: true }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+
+  /api/v2/admin/labels/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    put:
+      tags: [V2 Admin]
+      summary: Update label
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string, nullable: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [V2 Admin]
+      summary: Delete label
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/grants/pending:
+    get:
+      tags: [V2 Admin]
+      summary: List pending (failed) membership/credit grants
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/grants/{id}/retry:
+    post:
+      tags: [V2 Admin]
+      summary: Retry a single pending grant
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/grants/retry-all:
+    post:
+      tags: [V2 Admin]
+      summary: Retry every pending grant
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # ========================== Sync ==========================
+  /api/sync/typesense/status:
+    get:
+      tags: [Sync]
+      summary: Typesense status snapshot
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/sync/typesense/consistency:
+    get:
+      tags: [Sync]
+      summary: DB vs Typesense consistency report
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/sync/typesense/incremental:
+    post:
+      tags: [Sync]
+      summary: Incremental sync for specified asset ids
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assetIds]
+              properties:
+                assetIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/sync/typesense/full:
+    post:
+      tags: [Sync]
+      summary: Full sync (current collection mode — Blue-Green alias swap is deferred)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/sync/typesense/fix:
+    post:
+      tags: [Sync]
+      summary: Sampled consistency fix (bounded batch)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/sync/typesense/export:
+    get:
+      tags: [Sync]
+      summary: JSONL snapshot export
+      responses:
+        "200":
+          description: JSONL stream
+          content:
+            application/x-ndjson:
+              schema: { type: string }

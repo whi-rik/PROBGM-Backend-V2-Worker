@@ -256,6 +256,27 @@ Integration tests skip automatically when `TEST_DB_*` is unset or unreachable.
 All test data is prefixed (`IT-RDM-`, `IT-WHK-`) and cleaned up per-test; you
 can safely run against a shared dev database without affecting real rows.
 
+## OpenAPI / Swagger
+
+The full API surface is documented at [docs/openapi.yaml](./docs/openapi.yaml)
+(OpenAPI 3.0.3). Every cutover-scope endpoint is listed with auth, request
+shape, and response shape. Critical endpoints (redeem, auth, payments, billing)
+include fully resolved schemas; the rest reuse the shared `ApiResponse` /
+`Failure` envelopes.
+
+View it in any Swagger UI / Redoc viewer:
+
+```bash
+# Inline preview (Redoc)
+npx @redocly/cli preview-docs docs/openapi.yaml
+# Lint / validate the spec
+npx @redocly/cli lint docs/openapi.yaml
+# Generate static HTML
+npx @redocly/cli build-docs docs/openapi.yaml -o docs/api.html
+```
+
+Or paste the YAML into https://editor.swagger.io.
+
 ## Parity checks
 
 Compare the Worker against the legacy `PROBGM-Backend-TS` source and flag drift:
